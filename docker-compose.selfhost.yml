@@ -119,6 +119,13 @@ services:
       # in the database, so this single deployment-wide key is all the operator
       # needs to set here.
       MULTICA_SLACK_SECRET_KEY: ${MULTICA_SLACK_SECRET_KEY:-}
+      # Octo IM bot integration. MULTICA_OCTO_SECRET_KEY is the opt-in: unset =
+      # integration disabled. It decrypts the per-installation bot token stored
+      # encrypted in the database. MULTICA_OCTO_API_URL is the default Octo REST
+      # base used when an install omits its own api_url; Octo also needs
+      # MULTICA_PUBLIC_URL (above) to mint the clickable binding link.
+      MULTICA_OCTO_SECRET_KEY: ${MULTICA_OCTO_SECRET_KEY:-}
+      MULTICA_OCTO_API_URL: ${MULTICA_OCTO_API_URL:-}
     restart: unless-stopped
 
   frontend:
