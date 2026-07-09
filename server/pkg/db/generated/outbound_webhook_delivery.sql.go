@@ -60,8 +60,8 @@ type CreateOutboundWebhookDeliveryParams struct {
 // =====================
 // Outbound webhook delivery history
 // =====================
-// See migration 122. One row per dispatcher deliver() call for an outbound
-// webhook subscription (migration 121). All reads are scoped by workspace_id
+// See migration 151. One row per dispatcher deliver() call for an outbound
+// webhook subscription (migration 150). All reads are scoped by workspace_id
 // for multi-tenancy; the handler additionally scopes by subscription_id after
 // loading the subscription (owner/admin gated).
 // Written best-effort by the dispatcher at the terminal outcome of a delivery.

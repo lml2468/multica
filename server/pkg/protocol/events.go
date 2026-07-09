@@ -141,4 +141,11 @@ const (
 	// without deleting the row.
 	EventOctoInstallationCreated = "octo_installation:created"
 	EventOctoInstallationRevoked = "octo_installation:revoked"
+	// Slack installation lifecycle (MUL-3666). Same semantics as the Lark
+	// events: `created` covers both first install and OAuth re-install (the
+	// UNIQUE on (workspace_id, agent_id, channel_type) means at most one row
+	// per agent), `revoked` flips status without deleting the row. Front-ends
+	// invalidate the Slack installations query on either.
+	EventSlackInstallationCreated = "slack_installation:created"
+	EventSlackInstallationRevoked = "slack_installation:revoked"
 )

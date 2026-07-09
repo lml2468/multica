@@ -14,7 +14,7 @@ import (
 // ── Response type ─────────────────────────────────────────────────────────────
 
 // OutboundWebhookDeliveryResponse is the authenticated-API view of an
-// outbound_webhook_delivery row (see migration 122). The list endpoint returns
+// outbound_webhook_delivery row (see migration 151). The list endpoint returns
 // these without request/response bodies; the detail endpoint includes both for
 // debugging. The signing secret is never echoed through this surface.
 type OutboundWebhookDeliveryResponse struct {

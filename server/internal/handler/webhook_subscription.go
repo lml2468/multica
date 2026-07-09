@@ -20,7 +20,7 @@ import (
 
 // ── Outbound webhook subscriptions ──────────────────────────────────────────
 //
-// CRUD for webhook_subscription (see migration 121): external HTTP endpoints
+// CRUD for webhook_subscription (see migration 150): external HTTP endpoints
 // Multica POSTs to when subscribed issue events fire. project_id IS NULL is a
 // workspace-level webhook (GitHub "org" webhook); a set project_id is a
 // project-level webhook (GitHub "repo" webhook). All endpoints are gated to

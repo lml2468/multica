@@ -1,15 +1,17 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { Webhook, MessageSquare } from "lucide-react";
+import { MessageSquare, MessagesSquare, Webhook } from "lucide-react";
 import type { Agent } from "@multica/core/types";
 import { useAuthStore } from "@multica/core/auth";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { larkInstallationsOptions } from "@multica/core/lark";
 import { octoInstallationsOptions } from "@multica/core/octo";
+import { slackInstallationsOptions } from "@multica/core/slack";
 import { memberListOptions } from "@multica/core/workspace/queries";
 import { LarkAgentBindButton } from "../../../settings/components/lark-tab";
 import { OctoAgentBindButton } from "../../../settings/components/octo-tab";
+import { SlackAgentBindButton } from "../../../settings/components/slack-tab";
 import { useT } from "../../../i18n";
 
 /**
@@ -43,6 +45,10 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
     ...octoInstallationsOptions(wsId),
     enabled: !!wsId,
   });
+  const { data: slackListing } = useQuery({
+    ...slackInstallationsOptions(wsId),
+    enabled: !!wsId,
+  });
   const { data: members = [] } = useQuery({
     ...memberListOptions(wsId),
     enabled: !!wsId,
@@ -51,14 +57,50 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
   const configured = listing?.configured === true;
   const installSupported = listing?.install_supported === true;
   const currentMember = members.find((m) => m.user_id === user?.id) ?? null;
-  const canManage =
+  const isWorkspaceAdmin =
     currentMember?.role === "owner" || currentMember?.role === "admin";
+  const isAgentOwner =
+    !!user?.id && agent.owner_id != null && agent.owner_id === user.id;
+  // Lark bind/manage is authorized for the agent's owner OR a workspace
+  // owner/admin (server/internal/handler/lark.go canManageAgent, MUL-4213).
+  // Slack's install/revoke routes are still workspace owner/admin-only, so
+  // its gate stays admin-only — the agent owner must not see a Slack CTA the
+  // backend would 403.
+  const canManageLark = isWorkspaceAdmin || isAgentOwner;
+  const canManageSlack = isWorkspaceAdmin;
   const hasActiveInstall =
     listing?.installations.some(
       (inst) => inst.agent_id === agent.id && inst.status === "active",
     ) ?? false;
 
   const octoConfigured = octoListing?.configured === true;
+  const slackConfigured = slackListing?.configured === true;
+  const slackInstallSupported = slackListing?.install_supported === true;
+  const slackHasActiveInstall =
+    slackListing?.installations.some(
+      (inst) => inst.agent_id === agent.id && inst.status === "active",
+    ) ?? false;
+  // Octo configure/disconnect stay workspace owner/admin-only (see router.go),
+  // so its gate mirrors Slack's — the agent owner must not see a CTA the
+  // backend would 403.
+  const canManageOcto = isWorkspaceAdmin;
+
+  // A member who can manage none of the platforms (not a workspace admin and
+  // not this agent's owner) gets the read-only note instead of the sections.
+  // Members can still view connected bots in the (member-visible)
+  // Settings → Integrations listing.
+  if (!canManageLark && !canManageSlack && !canManageOcto) {
+    return (
+      <div className="space-y-6">
+        <p className="text-xs text-muted-foreground">
+          {t(($) => $.tab_body.integrations.intro)}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {t(($) => $.tab_body.integrations.members_note)}
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -86,14 +128,6 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
             <p className="text-xs text-muted-foreground">
               {ts(($) => $.lark.not_enabled_title)}
             </p>
-          ) : !canManage ? (
-            // The backend gates install / manage on workspace owner/admin.
-            // Members can still view connected bots in the (member-visible)
-            // Settings listing, so point them there rather than show a dead
-            // button.
-            <p className="text-xs text-muted-foreground">
-              {t(($) => $.tab_body.integrations.members_note)}
-            </p>
           ) : !installSupported && !hasActiveInstall ? (
             // Key is set but the device-flow transport isn't wired in this
             // build — a fresh scan would fail at the post-poll bot-info step,
@@ -108,10 +142,55 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
               </p>
             </div>
           ) : (
-            // Owner/admin with either a supported transport or an existing
-            // bot: the shared button renders the scan-to-bind CTA or the
-            // already-connected "Manage in Lark" badge.
-            <LarkAgentBindButton agentId={agent.id} agentName={agent.name} />
+            // Agent owner or workspace owner/admin with either a supported
+            // transport or an existing bot: the shared button renders the
+            // scan-to-bind CTA or the already-connected "Manage in Lark"
+            // badge. It self-authorizes on agentOwnerId + role.
+            <LarkAgentBindButton
+              agentId={agent.id}
+              agentName={agent.name}
+              agentOwnerId={agent.owner_id}
+            />
+          )}
+        </div>
+      </section>
+
+      <section className="rounded-lg border">
+        <div className="flex items-start gap-3 p-4">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border bg-muted/40 text-muted-foreground">
+            <MessagesSquare className="h-4 w-4" />
+          </span>
+          <div className="min-w-0 flex-1 space-y-1">
+            <h3 className="text-sm font-medium">{ts(($) => $.slack.section_title)}</h3>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {ts(($) => $.slack.page_description)}
+            </p>
+          </div>
+        </div>
+        <div className="border-t px-4 py-3">
+          {!canManageSlack ? (
+            // Slack install/revoke stay workspace owner/admin-only, so an
+            // agent owner who is not an admin only gets the read-only note
+            // here (unlike Lark above). Reuses the shared members note.
+            <p className="text-xs text-muted-foreground">
+              {t(($) => $.tab_body.integrations.members_note)}
+            </p>
+          ) : !slackConfigured ? (
+            <p className="text-xs text-muted-foreground">
+              {ts(($) => $.slack.not_enabled_title)}
+            </p>
+          ) : !slackInstallSupported && !slackHasActiveInstall ? (
+            // Secret key is set but the OAuth client credentials aren't, so a
+            // fresh "Connect Slack" would 503. Surface the "coming soon" notice
+            // instead of a broken CTA; an already-bound agent still renders.
+            <div className="space-y-1">
+              <p className="text-xs font-medium">{ts(($) => $.slack.preview_title)}</p>
+              <p className="text-xs text-muted-foreground">
+                {ts(($) => $.slack.preview_description)}
+              </p>
+            </div>
+          ) : (
+            <SlackAgentBindButton agentId={agent.id} agentName={agent.name} />
           )}
         </div>
       </section>
@@ -133,7 +212,7 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
             <p className="text-xs text-muted-foreground">
               {ts(($) => $.octo.not_enabled_note)}
             </p>
-          ) : !canManage ? (
+          ) : !canManageOcto ? (
             // The backend gates configure / disconnect on workspace owner/admin;
             // point members at the (member-visible) Settings listing instead of
             // a dead button.

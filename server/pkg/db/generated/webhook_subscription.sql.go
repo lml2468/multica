@@ -236,7 +236,7 @@ ORDER BY created_at DESC
 // =====================
 // Webhook subscriptions (outbound)
 // =====================
-// See migration 121. project_id IS NULL => workspace-level; otherwise
+// See migration 150. project_id IS NULL => workspace-level; otherwise
 // project-level. All reads/writes are scoped by workspace_id for multi-tenancy.
 // Workspace-level listing for the workspace settings UI: workspace-level
 // subscriptions only (project_id IS NULL).
