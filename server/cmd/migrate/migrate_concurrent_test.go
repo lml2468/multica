@@ -475,6 +475,160 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
+// TestRunOctoWebhookRenumberHook is the regression test for the v0.3.41
+// upstream-sync renumber (fork migrations 120-123 -> 149-152). It reproduces an
+// EXISTING deployment — the case fresh-DB tests structurally cannot exercise,
+// and the exact blind spot that let the 42P07 crash slip through review.
+//
+// Setup: a private schema whose schema_migrations records the OLD versions
+// 120-123 with the underlying octo/webhook tables already present (as a
+// pre-renumber deployment would have). We then run `up` over migration files
+// named with the NEW versions 149-152 (bare, non-idempotent CREATE TABLE, like
+// the real ones), with the renumber hook registered for 149.
+//
+// Asserts: (a) up succeeds with no 42P07 — the hook relabels before 149's SQL
+// and the runner then skips it; (b) schema_migrations ends up with 149-152 and
+// none of 120-123; (c) the pre-existing tables are untouched; (d) a second up is
+// a clean no-op.
+func TestRunOctoWebhookRenumberHook(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), raceTestTimeout)
+	defer cancel()
+
+	// Four migration files named with the NEW numbers. Bare CREATE TABLE so a
+	// re-run on an existing deployment (where the table already exists) would
+	// 42P07 unless the hook makes the runner skip it — mirroring the real
+	// 149-152 DDL.
+	renames := []struct{ oldVer, newVer, table string }{
+		{"120_octo_integration", "149_octo_integration", "octo_installation"},
+		{"121_webhook_subscription", "150_webhook_subscription", "webhook_subscription"},
+		{"122_outbound_webhook_delivery", "151_outbound_webhook_delivery", "outbound_webhook_delivery"},
+		{"123_webhook_subscription_failure_tracking", "152_webhook_subscription_failure_tracking", "webhook_subscription_failure"},
+	}
+	dir := t.TempDir()
+	files := make([]string, 0, len(renames))
+	for _, r := range renames {
+		body := fmt.Sprintf("CREATE TABLE %s.%s (id BIGSERIAL PRIMARY KEY);\n",
+			pgx.Identifier{f.schema}.Sanitize(), pgx.Identifier{r.table}.Sanitize())
+		path := filepath.Join(dir, r.newVer+".up.sql")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write migration: %v", err)
+		}
+		files = append(files, path)
+	}
+	sort.Strings(files)
+
+	// Simulate the pre-renumber deployment: create schema_migrations, record the
+	// OLD versions, and create the tables those migrations had already made.
+	if _, err := f.pool.Exec(ctx, fmt.Sprintf(
+		`CREATE TABLE %s (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+		pgx.Identifier{f.schema, "schema_migrations"}.Sanitize())); err != nil {
+		t.Fatalf("create schema_migrations: %v", err)
+	}
+	for _, r := range renames {
+		if _, err := f.pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (version) VALUES ($1)`,
+			pgx.Identifier{f.schema, "schema_migrations"}.Sanitize()), r.oldVer); err != nil {
+			t.Fatalf("seed old version %s: %v", r.oldVer, err)
+		}
+		if _, err := f.pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s.%s (id BIGSERIAL PRIMARY KEY)`,
+			pgx.Identifier{f.schema}.Sanitize(), pgx.Identifier{r.table}.Sanitize())); err != nil {
+			t.Fatalf("seed table %s: %v", r.table, err)
+		}
+	}
+
+	opts := runOptions{
+		Direction:             "up",
+		Files:                 files,
+		SchemaMigrationsTable: f.tableFQN,
+		AdvisoryLockKey:       f.lockKey,
+		Hooks: map[string]preMigrationHook{
+			"149_octo_integration": runOctoWebhookRenumberHook,
+		},
+	}
+
+	// (a) up must succeed — no 42P07 from re-running the bare CREATE TABLEs.
+	if err := runMigrations(ctx, f.pool, opts); err != nil {
+		t.Fatalf("up on simulated existing deployment returned error (expected clean reconcile): %v", err)
+	}
+
+	// (b) schema_migrations now carries 149-152, none of 120-123.
+	got := f.appliedVersions(t)
+	want := []string{
+		"149_octo_integration",
+		"150_webhook_subscription",
+		"151_outbound_webhook_delivery",
+		"152_webhook_subscription_failure_tracking",
+	}
+	if !equalStrings(got, want) {
+		t.Fatalf("schema_migrations after reconcile = %v, want %v (old versions must be relabeled, not duplicated)", got, want)
+	}
+
+	// (c) the pre-existing tables are still there (never dropped/recreated).
+	for _, r := range renames {
+		if !f.tableExists(t, r.table) {
+			t.Fatalf("table %s.%s missing after reconcile — hook or skip logic destroyed it", f.schema, r.table)
+		}
+	}
+
+	// (d) second up is a clean no-op (idempotent): hook finds new rows already
+	// present, drops nothing, and every version skips "already applied".
+	if err := runMigrations(ctx, f.pool, opts); err != nil {
+		t.Fatalf("second up (idempotency) returned error: %v", err)
+	}
+	if got2 := f.appliedVersions(t); !equalStrings(got2, want) {
+		t.Fatalf("schema_migrations changed on idempotent re-run: got %v, want %v", got2, want)
+	}
+}
+
+// TestRunOctoWebhookRenumberHookFreshInstall confirms the hook is a no-op on a
+// fresh database (one that never recorded 120-123): the relabel UPDATEs match
+// nothing, so 149-152 apply normally via their own SQL.
+func TestRunOctoWebhookRenumberHookFreshInstall(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), raceTestTimeout)
+	defer cancel()
+
+	renames := []struct{ newVer, table string }{
+		{"149_octo_integration", "octo_installation"},
+		{"150_webhook_subscription", "webhook_subscription"},
+	}
+	dir := t.TempDir()
+	files := make([]string, 0, len(renames))
+	for _, r := range renames {
+		body := fmt.Sprintf("CREATE TABLE %s.%s (id BIGSERIAL PRIMARY KEY);\n",
+			pgx.Identifier{f.schema}.Sanitize(), pgx.Identifier{r.table}.Sanitize())
+		path := filepath.Join(dir, r.newVer+".up.sql")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write migration: %v", err)
+		}
+		files = append(files, path)
+	}
+	sort.Strings(files)
+
+	opts := runOptions{
+		Direction:             "up",
+		Files:                 files,
+		SchemaMigrationsTable: f.tableFQN,
+		AdvisoryLockKey:       f.lockKey,
+		Hooks: map[string]preMigrationHook{
+			"149_octo_integration": runOctoWebhookRenumberHook,
+		},
+	}
+	if err := runMigrations(ctx, f.pool, opts); err != nil {
+		t.Fatalf("fresh-install up returned error: %v", err)
+	}
+	got := f.appliedVersions(t)
+	want := []string{"149_octo_integration", "150_webhook_subscription"}
+	if !equalStrings(got, want) {
+		t.Fatalf("fresh-install schema_migrations = %v, want %v", got, want)
+	}
+	for _, r := range renames {
+		if !f.tableExists(t, r.table) {
+			t.Fatalf("table %s.%s should have been created on fresh install", f.schema, r.table)
+		}
+	}
+}
+
 // TestRunMigrationsRejectsInvalidDirection pins the direction
 // whitelist contract: anything other than "up" or "down" must error
 // before runMigrations touches the pool. This prevents the subtle bug

@@ -24,7 +24,12 @@ import (
 // Returning an error aborts the migration run. The corresponding
 // migration is NOT recorded in schema_migrations, so the next run will
 // retry the hook + migration.
-type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
+// preMigrationHook runs before a migration's SQL. It receives the pool (not the
+// loop's pinned conn) so it can take its own session-level locks, and the
+// already-quoted, possibly schema-qualified schema_migrations identifier so a
+// hook that reconciles bookkeeping rows writes the SAME table the runner reads
+// (production uses the unqualified default; tests use a per-schema table).
+type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool, migrationsTable string) error
 
 // preMigrationHooks wires migration version → hook. The version key is
 // the file basename without the `.up.sql` suffix, matching what
@@ -58,23 +63,27 @@ var preMigrationHooks = map[string]preMigrationHook{
 // Mirrors the prior 119 -> 120 Octo renumber (commit 80638cf1d), whose ops note
 // established this relabel-in-place pattern — now automated so the auto-migrate
 // upgrade path self-heals instead of relying on out-of-band DB surgery.
-func runOctoWebhookRenumberHook(ctx context.Context, pool *pgxpool.Pool) error {
+func runOctoWebhookRenumberHook(ctx context.Context, pool *pgxpool.Pool, migrationsTable string) error {
 	renames := []struct{ old, new string }{
 		{"120_octo_integration", "149_octo_integration"},
 		{"121_webhook_subscription", "150_webhook_subscription"},
 		{"122_outbound_webhook_delivery", "151_outbound_webhook_delivery"},
 		{"123_webhook_subscription_failure_tracking", "152_webhook_subscription_failure_tracking"},
 	}
+	relabelSQL := fmt.Sprintf(
+		`UPDATE %s SET version = $2
+		 WHERE version = $1
+		   AND NOT EXISTS (SELECT 1 FROM %s WHERE version = $2)`,
+		migrationsTable, migrationsTable)
+	dropStaleSQL := fmt.Sprintf(
+		`DELETE FROM %s WHERE version = $1
+		   AND EXISTS (SELECT 1 FROM %s WHERE version = $2)`,
+		migrationsTable, migrationsTable)
 	for _, r := range renames {
 		// Guard against the pathological case where BOTH the old and new rows
-		// exist (e.g. a half-applied prior attempt): drop the new row's slot
-		// first would lose provenance, so instead skip the relabel when the new
-		// version is already present and just remove the stale old row.
-		tag, err := pool.Exec(ctx,
-			`UPDATE schema_migrations SET version = $2
-			 WHERE version = $1
-			   AND NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $2)`,
-			r.old, r.new)
+		// exist (e.g. a half-applied prior attempt): relabel only when the new
+		// version is absent, so provenance is never clobbered.
+		tag, err := pool.Exec(ctx, relabelSQL, r.old, r.new)
 		if err != nil {
 			return fmt.Errorf("relabel %s -> %s: %w", r.old, r.new, err)
 		}
@@ -84,17 +93,14 @@ func runOctoWebhookRenumberHook(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 		// New row already present (fresh install, or already relabeled): drop any
 		// leftover old row so the table doesn't carry both.
-		if _, err := pool.Exec(ctx,
-			`DELETE FROM schema_migrations WHERE version = $1
-			   AND EXISTS (SELECT 1 FROM schema_migrations WHERE version = $2)`,
-			r.old, r.new); err != nil {
+		if _, err := pool.Exec(ctx, dropStaleSQL, r.old, r.new); err != nil {
 			return fmt.Errorf("drop stale %s after %s present: %w", r.old, r.new, err)
 		}
 	}
 	return nil
 }
 
-func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool) error {
+func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool, _ string) error {
 	res, err := taskusagebackfill.Hook(ctx, pool, taskusagebackfill.HookOptions{})
 	if err != nil {
 		return fmt.Errorf("task_usage_hourly pre-103 hook: %w", err)
@@ -318,7 +324,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		if opts.Direction == "up" {
 			if hook, ok := opts.Hooks[version]; ok && hook != nil {
 				slog.Info("running pre-migration hook", "version", version)
-				if err := hook(ctx, pool); err != nil {
+				if err := hook(ctx, pool, tableIdent); err != nil {
 					return fmt.Errorf("pre-migration hook for %q: %w", version, err)
 				}
 				// A hook may reconcile schema_migrations so that this
