@@ -243,6 +243,12 @@ CREATE INDEX idx_octo_binding_token_installation
 -- origin_type='octo_chat' + origin_id=<chat_session.id>. Without this entry the
 -- CHECK rejects the insert (SQLSTATE 23514) and the connector takes an infra
 -- error per the Lark MUL-2671 precedent.
+--
+-- This migration was renumbered 120 -> 149 during the v0.3.41 upstream sync, so
+-- it now applies AFTER upstream's 131_issue_origin_slack_chat (which added
+-- 'slack_chat'). Because this statement full-replaces the CHECK, the list must
+-- be the union superset of every prior origin_type — otherwise the later-running
+-- 149 would silently drop 'slack_chat' and break Slack /issue creates.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_origin_type_check;
 ALTER TABLE issue ADD CONSTRAINT issue_origin_type_check
-    CHECK (origin_type IN ('autopilot', 'quick_create', 'lark_chat', 'octo_chat'));
+    CHECK (origin_type IN ('autopilot', 'quick_create', 'lark_chat', 'slack_chat', 'octo_chat'));
