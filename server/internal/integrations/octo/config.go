@@ -34,15 +34,13 @@ type installConfig struct {
 	BotTokenEncrypted string `json:"bot_token_encrypted"`
 }
 
-// credentials is the decoded, decrypted form the channel/outbound paths run on.
-// The installation IDENTITY (workspace / agent / installer) is deliberately
-// absent: it is resolved per message by the Router's InstallationResolver, as in
-// the Feishu and Slack adapters.
+// credentials is the decoded, decrypted form the channel/outbound paths run on:
+// just the API base and the plaintext bot token needed to Register/Send. The
+// installation IDENTITY (workspace / agent / installer) is resolved per message
+// by the Router's InstallationResolver, and display fields (robot_id, bot_name)
+// live in PublicConfig — neither belongs here.
 type credentials struct {
-	RobotID  string
-	BotName  string
 	APIURL   string
-	WSURL    string
 	BotToken string
 }
 
@@ -75,10 +73,7 @@ func decodeCredentials(raw json.RawMessage, decrypt Decrypter) (credentials, err
 		return credentials{}, fmt.Errorf("decrypt bot token: %w", err)
 	}
 	return credentials{
-		RobotID:  cfg.AppID,
-		BotName:  cfg.BotName,
 		APIURL:   cfg.APIURL,
-		WSURL:    cfg.WSURL,
 		BotToken: botToken,
 	}, nil
 }

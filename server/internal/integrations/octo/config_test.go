@@ -3,6 +3,7 @@ package octo
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
@@ -38,7 +39,7 @@ func TestEncodeDecodeConfig_RoundTrips(t *testing.T) {
 		t.Fatalf("encodeConfig: %v", err)
 	}
 	// Plaintext token must never appear in the stored blob.
-	if got := string(raw); containsSubstr(got, "bf_secret") {
+	if got := string(raw); strings.Contains(got, "bf_secret") {
 		t.Fatalf("plaintext token leaked into config: %s", got)
 	}
 
@@ -46,8 +47,8 @@ func TestEncodeDecodeConfig_RoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeCredentials: %v", err)
 	}
-	if creds.RobotID != "robot_9" || creds.APIURL != "https://im.example/api" || creds.WSURL != "wss://im.example/ws" {
-		t.Errorf("creds routing/urls wrong: %+v", creds)
+	if creds.APIURL != "https://im.example/api" {
+		t.Errorf("creds api_url wrong: %+v", creds)
 	}
 	if creds.BotToken != "bf_secret" {
 		t.Errorf("decrypted token = %q, want bf_secret", creds.BotToken)
@@ -102,13 +103,4 @@ func TestDecodeCredentials_NilDecrypterTreatsAsPlaintext(t *testing.T) {
 	if creds.BotToken != "plain_token" {
 		t.Errorf("token = %q, want plain_token", creds.BotToken)
 	}
-}
-
-func containsSubstr(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

@@ -206,10 +206,7 @@ func octoChannelType(binding db.ChannelChatSessionBinding) transport.ChannelType
 	if err := json.Unmarshal(binding.Config, &cfg); err == nil && cfg.OctoChannelType != 0 {
 		return transport.ChannelType(cfg.OctoChannelType)
 	}
-	if binding.ChatType == string(channel.ChatTypeP2P) {
-		return transport.ChannelDM
-	}
-	return transport.ChannelGroup
+	return chatTypeToChannel(channel.ChatType(binding.ChatType))
 }
 
 // encodeCardMessageID packs the WuKongIM (message_id, seq) pair into the single

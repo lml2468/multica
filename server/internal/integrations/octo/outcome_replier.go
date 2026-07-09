@@ -225,10 +225,7 @@ func octoChatType(msg channel.InboundMessage) transport.ChannelType {
 	if raw, err := decodeOctoRaw(msg); err == nil && raw.ChannelType != 0 {
 		return transport.ChannelType(raw.ChannelType)
 	}
-	if msg.Source.ChatType == channel.ChatTypeP2P {
-		return transport.ChannelDM
-	}
-	return transport.ChannelGroup
+	return chatTypeToChannel(msg.Source.ChatType)
 }
 
 // bindingPromptText is the user-facing copy DMed to an unbound sender. The link

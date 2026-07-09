@@ -247,6 +247,17 @@ func chatTypeFromChannel(t transport.ChannelType) channel.ChatType {
 	return channel.ChatTypeGroup
 }
 
+// chatTypeToChannel is the lossy inverse of chatTypeFromChannel, used only as a
+// fallback when the precise WuKongIM type (1/2/5) is unavailable — it cannot
+// recover community-topic (5), which collapsed into group. Callers prefer the
+// exact type stashed in msg.Raw / the binding config and fall back to this.
+func chatTypeToChannel(t channel.ChatType) transport.ChannelType {
+	if t == channel.ChatTypeP2P {
+		return transport.ChannelDM
+	}
+	return transport.ChannelGroup
+}
+
 // isConversationChannel reports whether a channel type is a real user
 // conversation (DM, group, or community topic). Octo also emits system/command
 // channels that must not be dispatched as user messages.

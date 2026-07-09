@@ -24,11 +24,10 @@ func testLogger() *slog.Logger {
 type fakeSocket struct {
 	mu          sync.Mutex
 	onError     func(error)
-	connectErr  error
 	disconnects int
 }
 
-func (f *fakeSocket) Connect(ctx context.Context) error { return f.connectErr }
+func (f *fakeSocket) Connect(ctx context.Context) error { return nil }
 
 func (f *fakeSocket) Disconnect() {
 	f.mu.Lock()
@@ -71,7 +70,7 @@ func newTestChannel(t *testing.T, handler channel.InboundHandler) (*octoChannel,
 	t.Helper()
 	sock := &fakeSocket{}
 	c := &octoChannel{
-		creds:   credentials{RobotID: "robot_1", APIURL: "https://im.example/api", BotToken: "bf_x"},
+		creds:   credentials{APIURL: "https://im.example/api", BotToken: "bf_x"},
 		handler: handler,
 		logger:  testLogger(),
 	}

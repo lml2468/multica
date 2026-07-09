@@ -15,10 +15,6 @@ import (
 // Octo uid is expected.
 type UID string
 
-// ChannelID identifies an Octo conversation (DM or group). One ChannelID maps to
-// one Multica chat_session via the channel_chat_session_binding row.
-type ChannelID string
-
 // InstallationStatus mirrors the channel_installation.status CHECK constraint.
 type InstallationStatus string
 

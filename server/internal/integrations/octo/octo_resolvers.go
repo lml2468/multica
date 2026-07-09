@@ -11,6 +11,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -65,13 +66,6 @@ func decodeOctoRaw(msg channel.InboundMessage) (octoRawEvent, error) {
 		return octoRawEvent{}, fmt.Errorf("decode octo inbound raw: %w", err)
 	}
 	return raw, nil
-}
-
-func nullText(s string) pgtype.Text {
-	if s == "" {
-		return pgtype.Text{}
-	}
-	return pgtype.Text{String: s, Valid: true}
 }
 
 // ---- installation routing ----
@@ -234,8 +228,8 @@ func (r *auditor) RecordDrop(ctx context.Context, instID pgtype.UUID, msg channe
 		EventType:        "", // Octo events carry no event_type discriminator.
 		DropReason:       string(reason),
 		InstallationID:   instID,
-		ChannelChatID:    nullText(msg.Source.ChatID),
-		ChannelEventID:   nullText(msg.EventID),
-		ChannelMessageID: nullText(msg.MessageID),
+		ChannelChatID:    util.StrToText(msg.Source.ChatID),
+		ChannelEventID:   util.StrToText(msg.EventID),
+		ChannelMessageID: util.StrToText(msg.MessageID),
 	})
 }
