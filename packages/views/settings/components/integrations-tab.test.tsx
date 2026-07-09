@@ -36,6 +36,10 @@ vi.mock("./lark-tab", () => ({
   LarkTab: () => <div data-testid="lark-tab" />,
 }));
 
+vi.mock("./octo-tab", () => ({
+  OctoTab: () => <div data-testid="octo-tab" />,
+}));
+
 vi.mock("./composio-tab", () => ({
   ComposioTab: () => <div data-testid="composio-tab" />,
 }));
