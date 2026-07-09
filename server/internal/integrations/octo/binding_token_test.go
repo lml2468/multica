@@ -126,14 +126,12 @@ func TestBindingToken_InvalidToken(t *testing.T) {
 	}
 }
 
-// TestBindingToken_NonMemberStillBinds documents the intentional behavior change
-// after convergence: the generalized channel_user_binding has NO member foreign
-// key (MUL-3515 §4 dropped cascades), so redeeming a token binds the uid even for
-// a user who is not a workspace member. Membership is instead enforced at inbound
-// time by the identity resolver (ResolveSender → ErrSenderNotMember). This test
-// pins that RedeemAndBind no longer returns ErrBindingNotWorkspaceMember, so the
-// gate must live in the resolver.
-func TestBindingToken_NonMemberStillBinds(t *testing.T) {
+// TestBindingToken_NonMemberRejected pins the explicit membership gate that
+// replaces the member FK the generalized channel_user_binding dropped (MUL-3515
+// §4): a non-member redeeming a token must get ErrBindingNotWorkspaceMember, the
+// consume must roll back (token not burned), and no binding may persist. Mirrors
+// the slack/lark behavior.
+func TestBindingToken_NonMemberRejected(t *testing.T) {
 	requireDB(t)
 	q := db.New(testPool)
 	wsID, userID, agentID := fixture(t)
@@ -154,7 +152,12 @@ func TestBindingToken_NonMemberStillBinds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if _, err := svc.RedeemAndBind(ctx, tok.Raw, outsiderID); err != nil {
-		t.Fatalf("non-member redeem should succeed now (membership gate moved to resolver): %v", err)
+	if _, err := svc.RedeemAndBind(ctx, tok.Raw, outsiderID); !errors.Is(err, octo.ErrBindingNotWorkspaceMember) {
+		t.Fatalf("non-member redeem err = %v, want ErrBindingNotWorkspaceMember", err)
+	}
+	// The membership gate returns before Commit, so the token must NOT be burned:
+	// a genuine member can still redeem it afterward.
+	if _, err := svc.RedeemAndBind(ctx, tok.Raw, userID); err != nil {
+		t.Errorf("token should survive a rejected non-member redeem, member redeem got: %v", err)
 	}
 }

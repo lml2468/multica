@@ -2,6 +2,7 @@ package octo
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -13,6 +14,13 @@ import (
 	"github.com/multica-ai/multica/server/internal/integrations/octo/transport"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+// octoRawJSON builds the octo-specific InboundMessage.Raw the adapter stashes, so
+// replier tests can exercise the real channel-type-from-Raw path.
+func octoRawJSON(robotID string, channelType int) json.RawMessage {
+	raw, _ := json.Marshal(octoRawEvent{RobotID: robotID, ChannelType: channelType})
+	return raw
+}
 
 // capturingSender records every Send call so a test can assert on the channel,
 // type, and content of the outbound reply.
@@ -163,7 +171,10 @@ func TestOutcomeReplier_AgentOffline_NotifiesChannel(t *testing.T) {
 	})
 
 	inst := replierInst()
-	msg := channel.InboundMessage{Source: channel.Source{ChatID: "grp_1", ChatType: channel.ChatTypeGroup, SenderID: "uid_42"}}
+	msg := channel.InboundMessage{
+		Source: channel.Source{ChatID: "grp_1", ChatType: channel.ChatTypeGroup, SenderID: "uid_42"},
+		Raw:    octoRawJSON("robot-1", int(transport.ChannelGroup)),
+	}
 	r.Reply(context.Background(), inst, msg, engine.Result{Outcome: engine.OutcomeAgentOffline})
 
 	if len(sender.calls) != 1 {
@@ -179,6 +190,34 @@ func TestOutcomeReplier_AgentOffline_NotifiesChannel(t *testing.T) {
 	}
 	if got.content != agentOfflineCopy {
 		t.Errorf("offline notice = %q, want %q", got.content, agentOfflineCopy)
+	}
+}
+
+// TestOutcomeReplier_TopicPreservesChannelType guards that an offline notice
+// triggered by a community-topic message (WuKongIM type 5) is addressed with
+// ChannelTopic, not collapsed to ChannelGroup — the real type is read from
+// msg.Raw, which Source.ChatType (p2p/group only) cannot carry.
+func TestOutcomeReplier_TopicPreservesChannelType(t *testing.T) {
+	sender := &capturingSender{}
+	r := NewOutcomeReplier(OutcomeReplierConfig{
+		Loader:    replierLoader(),
+		Minter:    &fakeMinter{},
+		Decryptor: fakeDecryptor{token: "bot-token"},
+		Sender:    sender,
+		PublicURL: "https://multica.example",
+	})
+
+	msg := channel.InboundMessage{
+		Source: channel.Source{ChatID: "topic_1", ChatType: channel.ChatTypeGroup, SenderID: "uid_42"},
+		Raw:    octoRawJSON("robot-1", int(transport.ChannelTopic)),
+	}
+	r.Reply(context.Background(), replierInst(), msg, engine.Result{Outcome: engine.OutcomeAgentOffline})
+
+	if len(sender.calls) != 1 {
+		t.Fatalf("Send called %d times, want 1", len(sender.calls))
+	}
+	if got := sender.calls[0]; got.channelType != transport.ChannelTopic {
+		t.Errorf("topic notice channel type = %d, want %d (topic); type was collapsed", got.channelType, transport.ChannelTopic)
 	}
 }
 

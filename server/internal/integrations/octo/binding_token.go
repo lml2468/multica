@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/util"
@@ -105,6 +104,21 @@ func (s *BindingTokenService) RedeemAndBind(ctx context.Context, raw string, mul
 		return RedeemedBindingToken{}, fmt.Errorf("consume token: %w", err)
 	}
 
+	// Explicit membership gate. The generalized channel_user_binding dropped the
+	// composite member FK that used to enforce this (MUL-3515 §4), so a non-member
+	// redemption would otherwise commit a stray binding and return 200. Check
+	// membership before the insert; returning before Commit rolls the consume back
+	// so a non-member's attempt does not burn the token. Mirrors slack/lark.
+	if _, err := qtx.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
+		UserID:      multicaUserID,
+		WorkspaceID: row.WorkspaceID,
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return RedeemedBindingToken{}, ErrBindingNotWorkspaceMember
+		}
+		return RedeemedBindingToken{}, fmt.Errorf("check membership: %w", err)
+	}
+
 	_, err = qtx.CreateChannelUserBinding(ctx, db.CreateChannelUserBindingParams{
 		WorkspaceID:    row.WorkspaceID,
 		MulticaUserID:  multicaUserID,
@@ -118,14 +132,6 @@ func (s *BindingTokenService) RedeemAndBind(ctx context.Context, raw string, mul
 		// multica_user_id, so the ON CONFLICT DO UPDATE WHERE rejected the rebind.
 		if errors.Is(err, pgx.ErrNoRows) {
 			return RedeemedBindingToken{}, ErrBindingAlreadyAssigned
-		}
-		// 23503 = foreign_key_violation. The generic channel_user_binding has no
-		// member FK (MUL-3515 §4 dropped cascades), so membership is enforced in
-		// the identity check, not here — but keep the mapping in case a deployment
-		// re-adds the composite FK.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
-			return RedeemedBindingToken{}, ErrBindingNotWorkspaceMember
 		}
 		return RedeemedBindingToken{}, fmt.Errorf("create binding: %w", err)
 	}

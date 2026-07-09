@@ -196,10 +196,11 @@ func (p *Patcher) sendReply(ctx context.Context, apiURL, token string, binding d
 	return nil
 }
 
-// octoChannelType reads the raw WuKongIM channel type persisted on the binding
-// config (octo_channel_type). It falls back to the chat_type discriminator when
-// the config is missing/malformed (p2p→DM, group→group), so an older binding
-// still routes.
+// octoChannelType reads the raw WuKongIM channel type (1=DM, 2=group, 5=topic)
+// persisted on the binding config (octo_channel_type). Migration 154 backfills it
+// for every folded row and octoBindingConfig writes it for every new binding, so
+// the config value is authoritative. The p2p/group default is defense against a
+// corrupt JSONB blob only, not a compatibility path.
 func octoChannelType(binding db.ChannelChatSessionBinding) transport.ChannelType {
 	var cfg octoBindingConfigBlob
 	if err := json.Unmarshal(binding.Config, &cfg); err == nil && cfg.OctoChannelType != 0 {
@@ -213,7 +214,7 @@ func octoChannelType(binding db.ChannelChatSessionBinding) transport.ChannelType
 
 // encodeCardMessageID packs the WuKongIM (message_id, seq) pair into the single
 // channel_card_message_id slot as "<message_id>:<seq>", the encoding migration
-// 154 uses. A streaming-edit path decodes it back with decodeCardMessageID.
+// 154 uses.
 func encodeCardMessageID(messageID string, seq uint32) string {
 	return fmt.Sprintf("%s:%d", messageID, seq)
 }

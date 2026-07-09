@@ -67,17 +67,16 @@ func (c *octoChannel) Capabilities() channel.Capability {
 func (c *octoChannel) Disconnect(ctx context.Context) error { return nil }
 
 // Send delivers a plain-text/markdown reply with this installation's bot token.
-// The engine's cross-platform OutboundMessage path uses this; Octo's primary
-// reply path is the Patcher (streaming edit anchor), so in practice the engine
-// rarely calls Send for Octo.
+// It exists to satisfy the Channel contract; Octo's real reply path is the
+// Patcher (which reads the stored octo_channel_type from the binding config and
+// preserves group/topic routing), and the engine.Router never calls Send for
+// Octo. The cross-platform OutboundMessage carries no channel type, so a bare
+// Send can only assume a DM — it must NOT be wired for group/topic replies until
+// OutboundMessage grows a chat-type field; those go through the Patcher.
 func (c *octoChannel) Send(ctx context.Context, out channel.OutboundMessage) (channel.SendResult, error) {
 	if c.sender == nil {
 		return channel.SendResult{}, errors.New("octo: message sender not configured")
 	}
-	// The engine's OutboundMessage does not carry the platform channel type; a
-	// bare cross-platform send targets the chat as a DM-style plain send. Rich
-	// group/topic routing goes through the Patcher, which reads the stored
-	// octo_channel_type from the binding config.
 	res, err := c.sender.Send(ctx, c.creds.APIURL, c.creds.BotToken, out.ChatID, transport.ChannelDM, out.Text)
 	if err != nil {
 		return channel.SendResult{}, err
@@ -118,9 +117,13 @@ func (c *octoChannel) Connect(ctx context.Context) error {
 	if register == nil {
 		// Register to obtain im_token + ws_url (the bot token alone can't open
 		// the WS). A fresh HTTP client per Connect is fine — reconnects are rare.
+		// force_refresh=true rotates the im_token: the Supervisor rebuilds this
+		// channel precisely because a prior connection died (often on a stale
+		// im_token), so a rebuild must not reuse the cached token or a
+		// stale-token terminal error would loop forever.
 		hc := transport.NewHTTPClient(c.creds.APIURL, c.creds.BotToken)
 		register = func(ctx context.Context) (*transport.BotRegisterResp, error) {
-			return hc.Register(ctx, false, "Multica", "")
+			return hc.Register(ctx, true, "Multica", "")
 		}
 	}
 	reg, err := register(ctx)

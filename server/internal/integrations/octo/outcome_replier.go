@@ -216,9 +216,15 @@ func (r *octoOutcomeReplier) sendDM(ctx context.Context, creds credentials, chan
 	return nil
 }
 
-// octoChatType maps the inbound message's chat type back to the WuKongIM channel
-// type for the outbound send. group covers both group and community topic.
+// octoChatType maps the inbound message back to the WuKongIM channel type for
+// the outbound send. It reads the real channel type (1/2/5) the adapter stashed
+// in msg.Raw so a community topic (5) is not lost — msg.Source.ChatType alone
+// collapses topic and group into "group". Falls back to the p2p/group
+// discriminator only when Raw is missing/unparseable.
 func octoChatType(msg channel.InboundMessage) transport.ChannelType {
+	if raw, err := decodeOctoRaw(msg); err == nil && raw.ChannelType != 0 {
+		return transport.ChannelType(raw.ChannelType)
+	}
 	if msg.Source.ChatType == channel.ChatTypeP2P {
 		return transport.ChannelDM
 	}
