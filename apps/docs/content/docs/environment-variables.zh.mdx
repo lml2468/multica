@@ -85,16 +85,18 @@ Multica 存储用户上传的附件（评论里的图片、文件等）。**优�
 | `S3_BUCKET` | 空 | **只填 bucket 名**（例如 `my-bucket`），**不要**带 `.s3.<region>.amazonaws.com` 后缀——server 会用 `S3_BUCKET` + `S3_REGION` 自己拼公开 host。设了就启用 S3 存储 |
 | `S3_REGION` | `us-west-2` | AWS 区域。必须和 bucket 所在区域一致——SDK 签名和公开 URL 都用它 |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | 空 | 静态凭证。全未设时用 AWS SDK 默认凭证链（IAM role / 环境凭证）|
-| `AWS_ENDPOINT_URL` | 空 | 自定义 S3 兼容端点（例如 [MinIO](https://min.io/)）。设了会切到 path-style URL |
+| `AWS_ENDPOINT_URL` | 空 | 自定义 S3 兼容端点（例如 [MinIO](https://min.io/) 或腾讯云 COS）。设了默认会切到 path-style URL——见 `S3_FORCE_PATH_STYLE` |
+| `S3_FORCE_PATH_STYLE` | 设了 `AWS_ENDPOINT_URL` 时默认 `true` | 部分 S3 兼容后端要求走 virtual-hosted-style 而不是 path-style，比如**腾讯云 COS**，用 path-style 会直接报 `PathStyleDomainForbidden`——这种情况下设为 `false`。不设 `AWS_ENDPOINT_URL` 时这个变量不生效 |
+| `S3_KEY_PREFIX` | 空 | 可选的对象 key 前缀（例如 `multica-prod`），用于多个应用共用同一个 bucket/CDN 域名时做目录隔离。首尾空白和斜杠都会被自动去掉。留空则保持现有不带前缀的 key。**请在第一次上传前就设置好**——上线后再修改不会迁移已有对象，会导致已有附件下载报 404、删除静默失效，除非手动把它们复制到新前缀目录下 |
 | `ATTACHMENT_DOWNLOAD_MODE` | `auto` | 附件下载路径：`auto`、`cloudfront`、`presign` 或 `proxy`。`auto` 下 CloudFront 配完整时优先 CloudFront；内网/私有 endpoint host 走 server proxy；公网 S3 兼容 endpoint 在支持时走 presigned GET |
 | `ATTACHMENT_DOWNLOAD_URL_TTL` | `30m` | CloudFront signed URL 和 S3 presigned download URL 的有效期。使用 Go duration 格式 |
 
 **`S3_BUCKET` 未设时**：server 启动时打 info 日志 `"S3_BUCKET not set, cloud upload disabled"`，所有上传回落到本地磁盘。
 
-**对象存储 URL** 按优先级拼装：
+**对象存储 URL** 按优先级拼装；设了 `S3_KEY_PREFIX` 时，下面的 `<key>` 均为 `<S3_KEY_PREFIX>/<key>`：
 
 1. 设了 `CLOUDFRONT_DOMAIN` → `https://<CLOUDFRONT_DOMAIN>/<key>`
-2. 设了 `AWS_ENDPOINT_URL` → `<AWS_ENDPOINT_URL>/<S3_BUCKET>/<key>`（path-style）
+2. 设了 `AWS_ENDPOINT_URL` → 默认 `<AWS_ENDPOINT_URL>/<S3_BUCKET>/<key>`（path-style）；`S3_FORCE_PATH_STYLE=false` 时改为 `<scheme>://<S3_BUCKET>.<endpoint-host>/<key>`（virtual-hosted-style）
 3. 默认走 AWS S3 → `https://<S3_BUCKET>.s3.<S3_REGION>.amazonaws.com/<key>`（virtual-hosted-style）。bucket 名含点时会回落到 `https://s3.<S3_REGION>.amazonaws.com/<S3_BUCKET>/<key>`（path-style），因为 AWS 通配证书无法覆盖含点 host。
 
 API 返回的 `download_url` 在未配置 CloudFront 签名时会指向 `GET /api/attachments/{id}/download`。这个端点会在安全时跳转到 CloudFront/S3 presigned URL；遇到 `http://rustfs:9000` 这类私有或内网 endpoint 时则由 server 流式转发。Docker/VPC 内部对象存储建议显式设置 `ATTACHMENT_DOWNLOAD_MODE=proxy`。

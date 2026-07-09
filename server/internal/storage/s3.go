@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,12 +19,13 @@ import (
 )
 
 type S3Storage struct {
-	client       *s3.Client
-	bucket       string
-	region       string // used to construct virtual-hosted-style public URLs when no CDN/endpoint is set
-	cdnDomain    string // if set, returned URLs use this instead of bucket name
-	endpointURL  string // custom S3-compatible endpoint (e.g. MinIO)
-	usePathStyle bool   // controls path-style S3 addressing
+	client             *s3.Client
+	bucket             string
+	region             string // used to construct virtual-hosted-style public URLs when no CDN/endpoint is set
+	cdnDomain          string // if set, returned URLs use this instead of bucket name
+	endpointURL        string // if set, use a custom endpoint (e.g. MinIO, Tencent COS) instead of AWS S3
+	virtualHostedStyle bool   // if true, use <bucket>.<endpoint-host> instead of path-style with endpointURL; some backends (e.g. Tencent COS) reject path-style with PathStyleDomainForbidden
+	keyPrefix          string // if set, prepended to every object key so a bucket/CDN domain can be shared with other apps
 }
 
 // NewS3StorageFromEnv creates an S3Storage from environment variables.
@@ -34,8 +35,18 @@ type S3Storage struct {
 //   - S3_BUCKET (required)
 //   - S3_REGION (default: us-west-2)
 //   - AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (optional; falls back to default credential chain)
-//   - AWS_ENDPOINT_URL (optional S3-compatible endpoint)
-//   - S3_USE_PATH_STYLE (optional; defaults to true when AWS_ENDPOINT_URL is set)
+//   - S3_FORCE_PATH_STYLE (optional boolean, default true when AWS_ENDPOINT_URL
+//     is set; matches the pre-existing always-path-style behavior needed by
+//     MinIO. Set to false for backends that require virtual-hosted-style
+//     requests instead, e.g. Tencent COS, which rejects path-style with
+//     PathStyleDomainForbidden)
+//   - S3_KEY_PREFIX (optional; surrounding whitespace and leading/trailing
+//     slashes are trimmed. Set it before the first upload — changing it
+//     later does not migrate already-uploaded objects: downloads/presigns
+//     against them start 404ing, and Delete silently no-ops on them since
+//     S3 DeleteObject does not error on a missing key, orphaning the real
+//     object. Only manually copying them under the new prefix restores
+//     access)
 func NewS3StorageFromEnv() *S3Storage {
 	bucket := os.Getenv("S3_BUCKET")
 	if bucket == "" {
@@ -74,27 +85,57 @@ func NewS3StorageFromEnv() *S3Storage {
 
 	cdnDomain := os.Getenv("CLOUDFRONT_DOMAIN")
 
+	forcePathStyle := parseForcePathStyle(os.Getenv("S3_FORCE_PATH_STYLE"))
+
 	endpointURL := os.Getenv("AWS_ENDPOINT_URL")
-	usePathStyle := s3UsePathStyleFromEnv(endpointURL)
 	s3Opts := []func(*s3.Options){}
-	if endpointURL != "" || usePathStyle {
+	if endpointURL != "" {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
-			if endpointURL != "" {
-				o.BaseEndpoint = aws.String(endpointURL)
-			}
-			o.UsePathStyle = usePathStyle
+			o.BaseEndpoint = aws.String(endpointURL)
+			o.UsePathStyle = forcePathStyle
 		})
 	}
+	virtualHostedStyle := endpointURL != "" && !forcePathStyle
 
-	slog.Info("S3 storage initialized", "bucket", bucket, "region", region, "cdn_domain", cdnDomain, "endpoint_url", endpointURL, "use_path_style", usePathStyle)
-	return &S3Storage{
-		client:       s3.NewFromConfig(cfg, s3Opts...),
-		bucket:       bucket,
-		region:       region,
-		cdnDomain:    cdnDomain,
-		endpointURL:  endpointURL,
-		usePathStyle: usePathStyle,
+	keyPrefix := normalizeKeyPrefix(os.Getenv("S3_KEY_PREFIX"))
+	if keyPrefixCollidesWithLogicalRoot(keyPrefix) {
+		slog.Warn(
+			"S3_KEY_PREFIX matches an existing top-level object key segment (\"users\" or \"workspaces\") — this corrupts the intermediate logical key KeyFromURL returns for objects uploaded before the prefix was set, even though S3 reads/writes still work because objectKey re-applies the same segment. Choose a different prefix.",
+			"value", keyPrefix,
+		)
 	}
+	if keyPrefixHasUnsafeCharacters(keyPrefix) {
+		slog.Warn(
+			"S3_KEY_PREFIX contains characters outside [A-Za-z0-9._/-] — these are concatenated raw into public URLs (no escaping), so spaces, query/fragment characters, or control characters can produce malformed URLs even though S3 itself would accept the object key.",
+			"value", keyPrefix,
+		)
+	}
+
+	slog.Info("S3 storage initialized", "bucket", bucket, "region", region, "cdn_domain", cdnDomain, "endpoint_url", endpointURL, "virtual_hosted_style", virtualHostedStyle, "key_prefix", keyPrefix)
+	return &S3Storage{
+		client:             s3.NewFromConfig(cfg, s3Opts...),
+		bucket:             bucket,
+		region:             region,
+		cdnDomain:          cdnDomain,
+		endpointURL:        endpointURL,
+		virtualHostedStyle: virtualHostedStyle,
+		keyPrefix:          keyPrefix,
+	}
+}
+
+// parseForcePathStyle parses S3_FORCE_PATH_STYLE, defaulting to true (the
+// pre-existing always-path-style behavior) when unset or unparseable so
+// existing MinIO-style deployments are unaffected.
+func parseForcePathStyle(raw string) bool {
+	if raw == "" {
+		return true
+	}
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("S3_FORCE_PATH_STYLE is not a valid boolean, defaulting to true (path-style)", "value", raw)
+		return true
+	}
+	return parsed
 }
 
 func (s *S3Storage) CdnDomain() string {
@@ -110,29 +151,75 @@ func looksLikeS3Hostname(bucket string) bool {
 	return strings.Contains(bucket, "amazonaws.com")
 }
 
-func s3UsePathStyleFromEnv(endpointURL string) bool {
-	defaultValue := endpointURL != ""
-	raw, ok := os.LookupEnv("S3_USE_PATH_STYLE")
-	if !ok || strings.TrimSpace(raw) == "" {
-		return defaultValue
-	}
-	parsed, err := parseBoolEnv(raw)
-	if err != nil {
-		slog.Warn("invalid S3_USE_PATH_STYLE value, using default", "value", raw, "default", defaultValue)
-		return defaultValue
-	}
-	return parsed
+// normalizeKeyPrefix trims surrounding whitespace and slashes from a raw
+// S3_KEY_PREFIX value, e.g. " /multica-prod/ " -> "multica-prod". A
+// slash-only value normalizes to "" (no prefix).
+func normalizeKeyPrefix(raw string) string {
+	return strings.Trim(strings.TrimSpace(raw), "/")
 }
 
-func parseBoolEnv(raw string) (bool, error) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "1", "t", "true", "y", "yes", "on":
-		return true, nil
-	case "0", "f", "false", "n", "no", "off":
-		return false, nil
-	default:
-		return false, fmt.Errorf("invalid bool %q", raw)
+// keyPrefixCollidesWithLogicalRoot reports whether prefix matches one of the
+// fixed top-level segments the uploader already writes objects under (see
+// file.go). Such a prefix corrupts the intermediate logical key that
+// KeyFromURL returns for objects uploaded before the prefix was configured —
+// S3 reads/writes still work because objectKey re-applies the identical
+// segment, but the logical key briefly round-trips through a wrong value.
+func keyPrefixCollidesWithLogicalRoot(prefix string) bool {
+	return prefix == "users" || prefix == "workspaces"
+}
+
+// keyPrefixHasUnsafeCharacters reports whether prefix contains characters
+// outside the conservative charset object keys and raw string-concatenated
+// URLs tolerate without escaping (see uploadedURL). S3 itself accepts a much
+// wider key charset, but a prefix with spaces, query/fragment characters, or
+// control characters corrupts the public URLs this package builds.
+func keyPrefixHasUnsafeCharacters(prefix string) bool {
+	for _, r := range prefix {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			continue
+		case r == '-' || r == '_' || r == '.' || r == '/':
+			continue
+		default:
+			return true
+		}
 	}
+	return false
+}
+
+// splitEndpointURL splits a configured AWS_ENDPOINT_URL into scheme and
+// host, e.g. "https://cos.ap-guangzhou.myqcloud.com/" ->
+// ("https", "cos.ap-guangzhou.myqcloud.com"). ok is false when the endpoint
+// has no recognized scheme.
+func splitEndpointURL(endpoint string) (scheme, host string, ok bool) {
+	trimmed := strings.TrimRight(endpoint, "/")
+	if rest, found := strings.CutPrefix(trimmed, "https://"); found {
+		return "https", rest, true
+	}
+	if rest, found := strings.CutPrefix(trimmed, "http://"); found {
+		return "http", rest, true
+	}
+	return "", "", false
+}
+
+// objectKey applies the configured key prefix (if any) to a logical key,
+// producing the actual key used against the S3 API. Callers throughout the
+// rest of the codebase only ever deal in logical keys (e.g. "users/u1/f.png");
+// this is the single point where the prefix is introduced.
+func (s *S3Storage) objectKey(key string) string {
+	if s.keyPrefix == "" {
+		return key
+	}
+	return s.keyPrefix + "/" + key
+}
+
+// stripKeyPrefix removes the configured key prefix from an S3 object key,
+// recovering the logical key. It is the inverse of objectKey.
+func (s *S3Storage) stripKeyPrefix(key string) string {
+	if s.keyPrefix == "" {
+		return key
+	}
+	return strings.TrimPrefix(key, s.keyPrefix+"/")
 }
 
 // storageClass returns the appropriate S3 storage class.
@@ -149,14 +236,25 @@ func (s *S3Storage) storageClass() types.StorageClass {
 //
 //	"https://my-bucket.s3.us-east-1.amazonaws.com/uploads/x/y.png" → "uploads/x/y.png"
 func (s *S3Storage) KeyFromURL(rawURL string) string {
+	return s.stripKeyPrefix(s.rawKeyFromURL(rawURL))
+}
+
+// rawKeyFromURL parses the object key out of a CDN or bucket URL as it is
+// physically stored in S3, i.e. including the configured key prefix (if any).
+func (s *S3Storage) rawKeyFromURL(rawURL string) string {
 	if s.endpointURL != "" {
-		for _, prefix := range []string{
-			customEndpointObjectPrefix(s.endpointURL, s.bucket, true),
-			customEndpointObjectPrefix(s.endpointURL, s.bucket, false),
-		} {
-			if strings.HasPrefix(rawURL, prefix) {
-				return strings.TrimPrefix(rawURL, prefix)
+		// Recognize both URL shapes regardless of the current
+		// S3_FORCE_PATH_STYLE setting, so a stored URL keeps resolving even
+		// after an operator flips that setting post-deployment.
+		if scheme, host, ok := splitEndpointURL(s.endpointURL); ok {
+			vhPrefix := scheme + "://" + s.bucket + "." + host + "/"
+			if strings.HasPrefix(rawURL, vhPrefix) {
+				return strings.TrimPrefix(rawURL, vhPrefix)
 			}
+		}
+		psPrefix := strings.TrimRight(s.endpointURL, "/") + "/" + s.bucket + "/"
+		if strings.HasPrefix(rawURL, psPrefix) {
+			return strings.TrimPrefix(rawURL, psPrefix)
 		}
 	}
 
@@ -202,7 +300,7 @@ func (s *S3Storage) GetReader(ctx context.Context, key string) (io.ReadCloser, e
 	}
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.objectKey(key)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("s3 GetObject: %w", err)
@@ -223,7 +321,7 @@ func (s *S3Storage) PresignGetWithContentDisposition(ctx context.Context, key st
 	}
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s.objectKey(key)),
 	}
 	if contentDisposition != "" {
 		input.ResponseContentDisposition = aws.String(contentDisposition)
@@ -242,12 +340,13 @@ func (s *S3Storage) Delete(ctx context.Context, key string) {
 	if key == "" {
 		return
 	}
+	objKey := s.objectKey(key)
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(objKey),
 	})
 	if err != nil {
-		slog.Error("s3 DeleteObject failed", "key", key, "error", err)
+		slog.Error("s3 DeleteObject failed", "key", objKey, "error", err)
 	}
 }
 
@@ -259,9 +358,10 @@ func (s *S3Storage) DeleteKeys(ctx context.Context, keys []string) {
 }
 
 func (s *S3Storage) Upload(ctx context.Context, key string, data []byte, contentType string, filename string) (string, error) {
+	objKey := s.objectKey(key)
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:             aws.String(s.bucket),
-		Key:                aws.String(key),
+		Key:                aws.String(objKey),
 		Body:               bytes.NewReader(data),
 		ContentType:        aws.String(contentType),
 		ContentDisposition: aws.String(ContentDisposition(contentType, filename)),
@@ -271,7 +371,7 @@ func (s *S3Storage) Upload(ctx context.Context, key string, data []byte, content
 	if err != nil {
 		return "", fmt.Errorf("s3 PutObject: %w", err)
 	}
-	return s.uploadedURL(key), nil
+	return s.uploadedURL(objKey), nil
 }
 
 // uploadedURL returns the URL stored for client consumption after an upload.
@@ -291,32 +391,15 @@ func (s *S3Storage) uploadedURL(key string) string {
 		return fmt.Sprintf("https://%s/%s", s.cdnDomain, key)
 	}
 	if s.endpointURL != "" {
-		return customEndpointObjectURL(s.endpointURL, s.bucket, key, s.usePathStyle)
+		if s.virtualHostedStyle {
+			if scheme, host, ok := splitEndpointURL(s.endpointURL); ok {
+				return fmt.Sprintf("%s://%s.%s/%s", scheme, s.bucket, host, key)
+			}
+		}
+		return fmt.Sprintf("%s/%s/%s", strings.TrimRight(s.endpointURL, "/"), s.bucket, key)
 	}
-	if s.usePathStyle || strings.Contains(s.bucket, ".") {
+	if strings.Contains(s.bucket, ".") {
 		return fmt.Sprintf("https://s3.%s.amazonaws.com/%s/%s", s.region, s.bucket, key)
 	}
 	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", s.bucket, s.region, key)
-}
-
-func customEndpointObjectURL(endpointURL, bucket, key string, usePathStyle bool) string {
-	return customEndpointObjectPrefix(endpointURL, bucket, usePathStyle) + key
-}
-
-func customEndpointObjectPrefix(endpointURL, bucket string, usePathStyle bool) string {
-	trimmed := strings.TrimRight(endpointURL, "/")
-	if usePathStyle {
-		return trimmed + "/" + bucket + "/"
-	}
-
-	u, err := url.Parse(trimmed)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return trimmed + "/"
-	}
-	u.Host = bucket + "." + u.Host
-	u.Path = strings.TrimRight(u.Path, "/") + "/"
-	u.RawPath = ""
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String()
 }

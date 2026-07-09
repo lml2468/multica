@@ -125,6 +125,10 @@ backend:
     googleRedirectUri: http://multica.dev.lan/auth/callback
     s3Bucket: ""
     s3Region: us-west-2
+    # Optional object key prefix for shared buckets/CDN domains (e.g. "multica-prod").
+    # Set before the first upload — changing it later does not migrate
+    # already-uploaded objects, breaking their downloads/deletes.
+    s3KeyPrefix: ""
     cloudfrontDomain: ""
     cloudfrontKeyPairId: ""
     localUploadBaseUrl: http://api.multica.dev.lan

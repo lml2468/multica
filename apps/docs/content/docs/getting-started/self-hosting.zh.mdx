@@ -277,7 +277,9 @@ For file uploads and attachments, configure S3 and (optionally) CloudFront:
 | `S3_BUCKET` | Bucket name only (e.g. `my-bucket`). Do **not** include the `.s3.<region>.amazonaws.com` suffix — the server constructs the public URL from `S3_BUCKET` + `S3_REGION` |
 | `S3_REGION` | AWS region (default: `us-west-2`). Must match the bucket's actual region — used for both SDK signing and public URLs |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Static credentials. When both are unset, the AWS SDK default credential chain is used |
-| `AWS_ENDPOINT_URL` | Custom S3-compatible endpoint (e.g. MinIO, R2, B2). Setting this switches to path-style URLs |
+| `AWS_ENDPOINT_URL` | Custom S3-compatible endpoint (e.g. MinIO, R2, B2, Tencent COS). Setting this switches to path-style URLs by default — see `S3_FORCE_PATH_STYLE` |
+| `S3_FORCE_PATH_STYLE` | Defaults to `true` when `AWS_ENDPOINT_URL` is set. Set to `false` for backends that require virtual-hosted-style requests, e.g. **Tencent COS**, which rejects path-style with `PathStyleDomainForbidden`. No effect unless `AWS_ENDPOINT_URL` is also set |
+| `S3_KEY_PREFIX` | Optional object key prefix (e.g. `multica-prod`) for sharing one bucket/CDN domain with other apps. Surrounding whitespace and leading/trailing slashes are trimmed. Leave unset to keep the existing unprefixed keys. **Set it before the first upload** — changing it later does not migrate already-uploaded objects, so their downloads start 404ing and deletes silently no-op until you copy them under the new prefix yourself |
 | `CLOUDFRONT_DOMAIN` | CloudFront distribution domain — when set, public URLs use this host instead of the S3 host |
 | `CLOUDFRONT_KEY_PAIR_ID` | CloudFront key pair ID for signed URLs |
 | `CLOUDFRONT_PRIVATE_KEY` | CloudFront private key (PEM format) |

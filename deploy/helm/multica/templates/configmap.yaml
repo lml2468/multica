@@ -21,6 +21,7 @@ data:
   GOOGLE_REDIRECT_URI: {{ .Values.backend.config.googleRedirectUri | quote }}
   S3_BUCKET: {{ .Values.backend.config.s3Bucket | quote }}
   S3_REGION: {{ .Values.backend.config.s3Region | quote }}
+  S3_KEY_PREFIX: {{ .Values.backend.config.s3KeyPrefix | quote }}
   CLOUDFRONT_DOMAIN: {{ .Values.backend.config.cloudfrontDomain | quote }}
   CLOUDFRONT_KEY_PAIR_ID: {{ .Values.backend.config.cloudfrontKeyPairId | quote }}
   LOCAL_UPLOAD_BASE_URL: {{ .Values.backend.config.localUploadBaseUrl | quote }}

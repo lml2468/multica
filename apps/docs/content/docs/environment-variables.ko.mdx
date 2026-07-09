@@ -85,16 +85,18 @@ Multica는 사용자가 업로드한 첨부 파일(댓글의 이미지와 파일
 | `S3_BUCKET` | 비어 있음 | **버킷 이름만** (예: `my-bucket`). `.s3.<region>.amazonaws.com` 접미사를 포함하지 **마세요** — 서버가 `S3_BUCKET` + `S3_REGION`으로 공개 호스트를 구성합니다. 이를 설정하면 S3 스토리지가 활성화됩니다 |
 | `S3_REGION` | `us-west-2` | AWS 리전. 버킷의 실제 리전과 일치해야 합니다 — SDK 서명과 공개 URL 구성 모두에 사용됩니다 |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | 비어 있음 | 정적 자격 증명. 둘 다 설정하지 않으면 AWS SDK 기본 자격 증명 체인(IAM role / 환경 자격 증명)이 사용됩니다 |
-| `AWS_ENDPOINT_URL` | 비어 있음 | 사용자 정의 S3 호환 엔드포인트 (예: [MinIO](https://min.io/)). 이를 설정하면 path-style URL로 전환됩니다 |
+| `AWS_ENDPOINT_URL` | 비어 있음 | 사용자 정의 S3 호환 엔드포인트 (예: [MinIO](https://min.io/) 또는 Tencent COS). 이를 설정하면 기본적으로 path-style URL로 전환됩니다 — `S3_FORCE_PATH_STYLE` 참고 |
+| `S3_FORCE_PATH_STYLE` | `AWS_ENDPOINT_URL` 설정 시 기본값 `true` | 일부 S3 호환 백엔드는 path-style 대신 virtual-hosted-style 요청을 요구합니다. 예를 들어 **Tencent COS**는 path-style 요청을 `PathStyleDomainForbidden`으로 거부합니다 — 이 경우 `false`로 설정하세요. `AWS_ENDPOINT_URL`이 설정되지 않으면 효과가 없습니다 |
+| `S3_KEY_PREFIX` | 비어 있음 | 선택적 객체 key 접두사 (예: `multica-prod`). 하나의 버킷/CDN 도메인을 다른 애플리케이션과 공유할 때 유용합니다. 앞뒤 공백과 슬래시는 자동으로 제거됩니다. 비워두면 기존의 접두사 없는 key가 그대로 유지됩니다. **첫 업로드 전에 반드시 설정하세요** — 나중에 변경하면 기존에 업로드된 객체는 마이그레이션되지 않아 다운로드는 404가 되고 삭제는 조용히 무시됩니다. 새 접두사 아래로 직접 복사하지 않는 한 복구되지 않습니다 |
 | `ATTACHMENT_DOWNLOAD_MODE` | `auto` | 첨부 파일 다운로드 방식: `auto`, `cloudfront`, `presign`, `proxy`. `auto`에서는 CloudFront가 완전히 설정되어 있으면 우선 사용하고, 내부/프라이빗 endpoint host는 server proxy를, 공개 S3 호환 endpoint는 지원되는 경우 presigned GET을 사용합니다 |
 | `ATTACHMENT_DOWNLOAD_URL_TTL` | `30m` | CloudFront signed URL 및 S3 presigned download URL의 유효 기간. Go duration 형식을 받습니다 |
 
 **`S3_BUCKET`을 설정하지 않으면**: 서버는 시작 시 `"S3_BUCKET not set, cloud upload disabled"`를 로깅하고, 모든 업로드는 로컬 디스크로 폴백합니다.
 
-**저장된 객체 URL**은 다음 우선순위 순서로 구성됩니다:
+**저장된 객체 URL**은 다음 우선순위 순서로 구성됩니다. `S3_KEY_PREFIX`가 설정된 경우 아래의 `<key>`는 모두 `<S3_KEY_PREFIX>/<key>`가 됩니다:
 
 1. `CLOUDFRONT_DOMAIN`이 설정된 경우 `https://<CLOUDFRONT_DOMAIN>/<key>`.
-2. `AWS_ENDPOINT_URL`이 설정된 경우 `<AWS_ENDPOINT_URL>/<S3_BUCKET>/<key>` (path-style).
+2. `AWS_ENDPOINT_URL`이 설정된 경우, 기본값은 `<AWS_ENDPOINT_URL>/<S3_BUCKET>/<key>` (path-style). `S3_FORCE_PATH_STYLE=false`이면 `<scheme>://<S3_BUCKET>.<endpoint-host>/<key>` (virtual-hosted-style)가 됩니다.
 3. `https://<S3_BUCKET>.s3.<S3_REGION>.amazonaws.com/<key>` (virtual-hosted-style). `S3_BUCKET`에 점이 포함된 경우, AWS가 발급한 와일드카드 TLS 인증서가 점이 포함된 버킷 호스트를 검증하지 못하므로 서버는 `https://s3.<S3_REGION>.amazonaws.com/<S3_BUCKET>/<key>` (path-style)로 폴백합니다.
 
 API `download_url` 값은 CloudFront 서명이 설정되지 않은 경우 `GET /api/attachments/{id}/download`를 사용합니다. 이 endpoint는 안전한 경우 CloudFront/S3 presigned URL로 리디렉션하고, `http://rustfs:9000` 같은 프라이빗/내부 endpoint에서는 server가 스트리밍합니다. Docker/VPC 내부 객체 저장소에서는 `ATTACHMENT_DOWNLOAD_MODE=proxy`를 명시할 수 있습니다.
