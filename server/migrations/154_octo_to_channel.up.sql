@@ -130,6 +130,56 @@ SELECT
 FROM octo_binding_token;
 
 -- =====================
+-- prove the fold before the irreversible DROP
+-- =====================
+-- Atomicity (the whole file runs as one implicit tx) already rolls back a FAILED
+-- insert, but it cannot catch a SILENT logic mismatch — a wrong JOIN/WHERE, a
+-- misrouting CASE, or a filter copying fewer rows than exist would commit and
+-- then drop the source. Octo migrations have a corruption history (the 120->149
+-- renumber saga), so assert the copied row counts match per table and abort the
+-- whole migration (before the DROP) on any mismatch. The counts are cheap next
+-- to the DROP they guard.
+DO $$
+DECLARE
+    mismatch text;
+BEGIN
+    SELECT string_agg(t, ', ') INTO mismatch FROM (
+        SELECT 'installation' AS t
+            WHERE (SELECT count(*) FROM octo_installation)
+                <> (SELECT count(*) FROM channel_installation WHERE channel_type = 'octo')
+        UNION ALL
+        SELECT 'user_binding'
+            WHERE (SELECT count(*) FROM octo_user_binding)
+                <> (SELECT count(*) FROM channel_user_binding WHERE channel_type = 'octo')
+        UNION ALL
+        SELECT 'chat_session_binding'
+            WHERE (SELECT count(*) FROM octo_chat_session_binding)
+                <> (SELECT count(*) FROM channel_chat_session_binding WHERE channel_type = 'octo')
+        UNION ALL
+        SELECT 'inbound_dedup'
+            WHERE (SELECT count(*) FROM octo_inbound_dedup)
+                <> (SELECT count(*) FROM channel_inbound_message_dedup d
+                    JOIN channel_installation i ON i.id = d.installation_id
+                    WHERE i.channel_type = 'octo')
+        UNION ALL
+        SELECT 'inbound_audit'
+            WHERE (SELECT count(*) FROM octo_inbound_audit)
+                <> (SELECT count(*) FROM channel_inbound_audit WHERE channel_type = 'octo')
+        UNION ALL
+        SELECT 'outbound_message'
+            WHERE (SELECT count(*) FROM octo_outbound_message)
+                <> (SELECT count(*) FROM channel_outbound_card_message WHERE channel_type = 'octo')
+        UNION ALL
+        SELECT 'binding_token'
+            WHERE (SELECT count(*) FROM octo_binding_token)
+                <> (SELECT count(*) FROM channel_binding_token WHERE channel_type = 'octo')
+    ) m;
+    IF mismatch IS NOT NULL THEN
+        RAISE EXCEPTION 'octo->channel fold row-count mismatch in: %; aborting before DROP', mismatch;
+    END IF;
+END $$;
+
+-- =====================
 -- drop the parallel octo_* stack
 -- =====================
 -- CASCADE clears the composite FKs octo_user_binding / octo_chat_session_binding
