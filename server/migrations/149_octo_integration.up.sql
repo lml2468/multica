@@ -6,17 +6,12 @@
 -- order after upstream's new 127-148. The migrate runner keys schema_migrations
 -- by full filename, so a database that already applied the OLD name
 -- (120_octo_integration, and 121-123 for the webhook siblings) would treat 149
--- as unapplied and re-run this CREATE TABLE -> 42P07 duplicate_table. FRESH
--- deploys are unaffected. Existing deployments must relabel the recorded
--- versions BEFORE migrating (idempotent, safe to re-run):
---
---   UPDATE schema_migrations SET version='149_octo_integration'                     WHERE version='120_octo_integration';
---   UPDATE schema_migrations SET version='150_webhook_subscription'                 WHERE version='121_webhook_subscription';
---   UPDATE schema_migrations SET version='151_outbound_webhook_delivery'            WHERE version='122_outbound_webhook_delivery';
---   UPDATE schema_migrations SET version='152_webhook_subscription_failure_tracking' WHERE version='123_webhook_subscription_failure_tracking';
---
--- This mirrors the prior 119 -> 120 Octo renumber (commit 80638cf1d), whose
--- ops note established the same relabel-in-place pattern.
+-- as unapplied and re-run this CREATE TABLE -> 42P07 duplicate_table. This is
+-- handled automatically by the runOctoWebhookRenumberHook pre-migration hook
+-- (cmd/migrate/main.go), which relabels the recorded 120-123 versions to
+-- 149-152 before this SQL runs, so 149-152 are then seen as applied and skipped.
+-- Fresh deploys never recorded 120-123, so the hook no-ops there. Mirrors the
+-- prior 119 -> 120 Octo renumber (commit 80638cf1d).
 --
 -- This mirrors the Lark integration (migration 109) structurally, with these
 -- Octo-specific differences:
