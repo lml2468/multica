@@ -4,9 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"strings"
 	"testing"
-
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/octo"
 	"github.com/multica-ai/multica/server/internal/util/secretbox"
@@ -53,9 +52,13 @@ func TestInstallationService_UpsertDecryptRoundTrip(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	// Ciphertext must not be the plaintext.
-	if string(inst.BotTokenEncrypted) == token {
-		t.Fatal("bot token stored in plaintext")
+	// The config blob must not contain the plaintext token anywhere.
+	if strings.Contains(string(inst.Config), token) {
+		t.Fatalf("bot token stored in plaintext inside config: %s", inst.Config)
+	}
+	// robot_id is stored in the routing-key slot so the generic query resolves it.
+	if pub := octo.DecodePublicConfig(inst.Config); pub.BotName != "Octo-Z" {
+		t.Errorf("DecodePublicConfig bot_name = %q, want Octo-Z", pub.BotName)
 	}
 
 	// DecryptBotToken round-trips to the original.
@@ -74,10 +77,10 @@ func TestInstallationService_NilBoxRejected(t *testing.T) {
 	}
 }
 
-// TestInstallationService_RobotAlreadyBound guards the fix for the 500 an admin
-// hit when binding a bot whose robot_id is already in use by a different agent.
-// The deployment-wide UNIQUE(robot_id) constraint must surface as the typed
-// ErrRobotAlreadyBound (→ 409), not a raw DB error (→ 500).
+// TestInstallationService_RobotAlreadyBound guards the 409 an admin must get when
+// binding a bot whose robot_id is already in use by a different agent. The
+// deployment-wide (channel_type, config->>'app_id') unique index must surface as
+// the typed ErrRobotAlreadyBound, not a raw DB error (→ 500).
 func TestInstallationService_RobotAlreadyBound(t *testing.T) {
 	requireDB(t)
 	q := db.New(testPool)
@@ -93,19 +96,10 @@ func TestInstallationService_RobotAlreadyBound(t *testing.T) {
 		t.Fatalf("first Upsert: %v", err)
 	}
 
-	// A second agent in the same workspace trying to bind the SAME bot
-	// (same robot_id) must be rejected with the typed error — the upsert's
-	// ON CONFLICT only covers (workspace_id, agent_id), so this is an INSERT
-	// that trips UNIQUE(robot_id).
-	var agentID2 pgtype.UUID
-	if err := testPool.QueryRow(ctx,
-		`INSERT INTO agent (workspace_id, name, runtime_mode, runtime_id)
-		 SELECT $1, 'Octo Agent 2', 'local', runtime_id FROM agent WHERE id = $2
-		 RETURNING id`,
-		wsID, agentID).Scan(&agentID2); err != nil {
-		t.Fatalf("create second agent: %v", err)
-	}
-
+	// A second agent binding the SAME bot (same robot_id) must be rejected: the
+	// upsert conflict target is (channel_type, app_id), so a different agent with
+	// the same robot_id trips the unique index.
+	agentID2 := secondAgent(t, wsID, agentID)
 	_, err := svc.Upsert(ctx, octo.InstallationParams{
 		WorkspaceID: wsID, AgentID: agentID2, BotToken: "bf_b",
 		RobotID: robotID, APIURL: "https://im.example/api", InstallerUserID: userID,
@@ -115,9 +109,9 @@ func TestInstallationService_RobotAlreadyBound(t *testing.T) {
 	}
 }
 
-// TestInstallationService_ReconfigureSameAgentSucceeds confirms the fix did not
-// break the legitimate re-configure path: re-binding the SAME (workspace, agent)
-// with the same robot_id hits ON CONFLICT DO UPDATE and must succeed.
+// TestInstallationService_ReconfigureSameAgentSucceeds confirms the legitimate
+// re-configure path still works: re-binding the SAME robot_id hits ON CONFLICT DO
+// UPDATE and must succeed in place.
 func TestInstallationService_ReconfigureSameAgentSucceeds(t *testing.T) {
 	requireDB(t)
 	q := db.New(testPool)
@@ -166,8 +160,10 @@ func TestInstallationService_Revoke(t *testing.T) {
 	if err := svc.Revoke(ctx, inst.ID); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
-	active, _ := q.ListActiveOctoInstallations(ctx)
-	if containsInstallation(active, inst.ID) {
-		t.Error("revoked installation still active")
+	active, _ := q.ListAllActiveChannelInstallations(ctx)
+	for _, row := range active {
+		if row.ID == inst.ID {
+			t.Error("revoked installation still active")
+		}
 	}
 }

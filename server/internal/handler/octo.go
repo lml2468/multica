@@ -31,13 +31,14 @@ type OctoInstallationResponse struct {
 	UpdatedAt       string `json:"updated_at"`
 }
 
-func octoInstallationToResponse(row db.OctoInstallation) OctoInstallationResponse {
+func octoInstallationToResponse(row db.ChannelInstallation) OctoInstallationResponse {
+	pub := octo.DecodePublicConfig(row.Config)
 	return OctoInstallationResponse{
 		ID:              uuidToString(row.ID),
 		WorkspaceID:     uuidToString(row.WorkspaceID),
 		AgentID:         uuidToString(row.AgentID),
-		RobotID:         row.RobotID,
-		BotName:         row.BotName,
+		RobotID:         pub.RobotID,
+		BotName:         pub.BotName,
 		InstallerUserID: uuidToString(row.InstallerUserID),
 		Status:          row.Status,
 		InstalledAt:     row.InstalledAt.Time.UTC().Format(time.RFC3339),

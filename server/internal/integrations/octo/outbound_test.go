@@ -2,6 +2,8 @@ package octo
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -14,37 +16,61 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-type fakePatcherQueries struct {
-	binding    db.OctoChatSessionBinding
-	bindingErr error
-	inst       db.OctoInstallation
-	instErr    error
-	recorded   *db.CreateOctoOutboundMessageParams
+// validUUID builds a deterministic non-zero pgtype.UUID for tests.
+func validUUID(b byte) pgtype.UUID {
+	var u pgtype.UUID
+	for i := range u.Bytes {
+		u.Bytes[i] = b
+	}
+	u.Valid = true
+	return u
 }
 
-func (f *fakePatcherQueries) GetOctoChatSessionBindingBySession(ctx context.Context, id pgtype.UUID) (db.OctoChatSessionBinding, error) {
+// octoConfigJSON builds a channel_installation.config blob for tests. The bot
+// token is stored as base64 plaintext (the tests use a nil/identity decrypter).
+func octoConfigJSON(robotID, apiURL, botToken string) []byte {
+	raw, _ := json.Marshal(installConfig{
+		AppID:             robotID,
+		APIURL:            apiURL,
+		BotTokenEncrypted: base64.StdEncoding.EncodeToString([]byte(botToken)),
+	})
+	return raw
+}
+
+type fakePatcherQueries struct {
+	binding    db.ChannelChatSessionBinding
+	bindingErr error
+	inst       db.ChannelInstallation
+	instErr    error
+	recorded   *db.CreateChannelOutboundCardMessageParams
+}
+
+func (f *fakePatcherQueries) GetChannelChatSessionBindingBySession(ctx context.Context, arg db.GetChannelChatSessionBindingBySessionParams) (db.ChannelChatSessionBinding, error) {
 	return f.binding, f.bindingErr
 }
-func (f *fakePatcherQueries) GetOctoInstallation(ctx context.Context, id pgtype.UUID) (db.OctoInstallation, error) {
+func (f *fakePatcherQueries) GetChannelInstallation(ctx context.Context, arg db.GetChannelInstallationParams) (db.ChannelInstallation, error) {
 	return f.inst, f.instErr
 }
-func (f *fakePatcherQueries) CreateOctoOutboundMessage(ctx context.Context, arg db.CreateOctoOutboundMessageParams) (db.OctoOutboundMessage, error) {
+func (f *fakePatcherQueries) CreateChannelOutboundCardMessage(ctx context.Context, arg db.CreateChannelOutboundCardMessageParams) (db.ChannelOutboundCardMessage, error) {
 	f.recorded = &arg
-	return db.OctoOutboundMessage{}, nil
+	return db.ChannelOutboundCardMessage{}, nil
 }
 
+// fakeDecryptor returns a fixed plaintext bot token regardless of the stored
+// config, so outbound tests need not seal a real ciphertext.
 type fakeDecryptor struct {
 	token string
 	err   error
 }
 
-func (f fakeDecryptor) DecryptBotToken(inst db.OctoInstallation) (string, error) {
+func (f fakeDecryptor) DecryptBotToken(inst db.ChannelInstallation) (string, error) {
 	return f.token, f.err
 }
 
 type fakeSender struct {
 	sent    int
 	lastTxt string
+	lastCT  transport.ChannelType
 	res     *transport.SendMessageResult
 	err     error
 }
@@ -52,22 +78,31 @@ type fakeSender struct {
 func (f *fakeSender) Send(ctx context.Context, apiURL, botToken, channelID string, channelType transport.ChannelType, content string) (*transport.SendMessageResult, error) {
 	f.sent++
 	f.lastTxt = content
+	f.lastCT = channelType
 	if f.res == nil {
 		f.res = &transport.SendMessageResult{MessageID: "m1", MessageSeq: 5}
 	}
 	return f.res, f.err
 }
 
-func activeInst() db.OctoInstallation {
-	return db.OctoInstallation{ID: validUUID(0xAA), Status: "active", ApiUrl: "https://im.example/api"}
+func activeInst() db.ChannelInstallation {
+	return db.ChannelInstallation{
+		ID:          validUUID(0xAA),
+		Status:      "active",
+		ChannelType: string(TypeOcto),
+		Config:      octoConfigJSON("robot-1", "https://im.example/api", "bf_x"),
+	}
 }
 
-func octoBinding() db.OctoChatSessionBinding {
-	return db.OctoChatSessionBinding{
-		ChatSessionID:   validUUID(0x22),
-		InstallationID:  validUUID(0xAA),
-		OctoChannelID:   "ch_1",
-		OctoChannelType: 1,
+func octoBinding() db.ChannelChatSessionBinding {
+	cfg, _ := json.Marshal(octoBindingConfigBlob{OctoChannelType: 1})
+	return db.ChannelChatSessionBinding{
+		ChatSessionID:  validUUID(0x22),
+		InstallationID: validUUID(0xAA),
+		ChannelType:    string(TypeOcto),
+		ChannelChatID:  "ch_1",
+		ChatType:       "p2p",
+		Config:         cfg,
 	}
 }
 
@@ -95,8 +130,29 @@ func TestProcessEvent_ChatDone_SendsReply(t *testing.T) {
 	if s.sent != 1 || s.lastTxt != "hello world" {
 		t.Errorf("sent=%d lastTxt=%q", s.sent, s.lastTxt)
 	}
-	if q.recorded == nil || q.recorded.OctoMessageID != "m1" {
-		t.Errorf("expected outbound message recorded with id m1, got %+v", q.recorded)
+	// The (message_id, seq) pair is encoded into the single card-message-id slot.
+	if q.recorded == nil || q.recorded.ChannelCardMessageID != "m1:5" {
+		t.Errorf("expected outbound card recorded with id m1:5, got %+v", q.recorded)
+	}
+	if s.lastCT != transport.ChannelDM {
+		t.Errorf("p2p binding should send as DM, got channel type %d", s.lastCT)
+	}
+}
+
+func TestProcessEvent_GroupBinding_UsesStoredChannelType(t *testing.T) {
+	binding := octoBinding()
+	binding.ChatType = "group"
+	cfg, _ := json.Marshal(octoBindingConfigBlob{OctoChannelType: int(transport.ChannelTopic)})
+	binding.Config = cfg
+	q := &fakePatcherQueries{binding: binding, inst: activeInst()}
+	s := &fakeSender{}
+	p := newPatcher(q, s)
+
+	if err := p.processEvent(context.Background(), chatDoneEvent("hi")); err != nil {
+		t.Fatalf("processEvent: %v", err)
+	}
+	if s.lastCT != transport.ChannelTopic {
+		t.Errorf("expected stored octo_channel_type %d, got %d", transport.ChannelTopic, s.lastCT)
 	}
 }
 
@@ -124,8 +180,6 @@ func TestProcessEvent_TaskFailed_FallsBackToFailureReason(t *testing.T) {
 	s := &fakeSender{}
 	p := newPatcher(q, s)
 
-	// No explicit error string — only the coarse classifier. The relay must
-	// translate it into the friendly Chinese copy, not the generic fallback.
 	e := events.Event{
 		Type:          protocol.EventTaskFailed,
 		TaskID:        "11111111-1111-1111-1111-111111111111",
@@ -146,8 +200,6 @@ func TestProcessEvent_TaskFailed_DefaultWhenNoDetail(t *testing.T) {
 	s := &fakeSender{}
 	p := newPatcher(q, s)
 
-	// Neither error nor failure_reason — the user still gets an actionable,
-	// non-empty message rather than a bare or English fallback.
 	e := events.Event{
 		Type:          protocol.EventTaskFailed,
 		TaskID:        "11111111-1111-1111-1111-111111111111",
@@ -232,7 +284,6 @@ func TestProcessEvent_NoChatSession_Skips(t *testing.T) {
 	s := &fakeSender{}
 	p := newPatcher(q, s)
 
-	// Issue task: task_id present, no chat_session_id.
 	e := events.Event{Type: protocol.EventTaskFailed, TaskID: "11111111-1111-1111-1111-111111111111", Payload: map[string]any{"error": "x"}}
 	if err := p.processEvent(context.Background(), e); err != nil {
 		t.Fatalf("processEvent: %v", err)

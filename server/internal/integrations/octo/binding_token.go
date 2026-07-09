@@ -61,11 +61,12 @@ func (s *BindingTokenService) Mint(ctx context.Context, workspaceID, installatio
 		return BindingToken{}, fmt.Errorf("generate token: %w", err)
 	}
 	expiresAt := s.now().Add(BindingTokenTTL)
-	if _, err := s.queries.CreateOctoBindingToken(ctx, db.CreateOctoBindingTokenParams{
+	if _, err := s.queries.CreateChannelBindingToken(ctx, db.CreateChannelBindingTokenParams{
 		TokenHash:      hashToken(raw),
 		WorkspaceID:    workspaceID,
 		InstallationID: installationID,
-		OctoUid:        string(uid),
+		ChannelType:    string(TypeOcto),
+		ChannelUserID:  string(uid),
 		ExpiresAt:      pgtype.Timestamptz{Time: expiresAt, Valid: true},
 	}); err != nil {
 		return BindingToken{}, fmt.Errorf("persist token: %w", err)
@@ -96,7 +97,7 @@ func (s *BindingTokenService) RedeemAndBind(ctx context.Context, raw string, mul
 	defer tx.Rollback(ctx)
 	qtx := s.queries.WithTx(tx)
 
-	row, err := qtx.ConsumeOctoBindingToken(ctx, hashToken(raw))
+	row, err := qtx.ConsumeChannelBindingToken(ctx, hashToken(raw))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return RedeemedBindingToken{}, ErrBindingTokenInvalid
@@ -104,11 +105,13 @@ func (s *BindingTokenService) RedeemAndBind(ctx context.Context, raw string, mul
 		return RedeemedBindingToken{}, fmt.Errorf("consume token: %w", err)
 	}
 
-	_, err = qtx.CreateOctoUserBinding(ctx, db.CreateOctoUserBindingParams{
+	_, err = qtx.CreateChannelUserBinding(ctx, db.CreateChannelUserBindingParams{
 		WorkspaceID:    row.WorkspaceID,
 		MulticaUserID:  multicaUserID,
 		InstallationID: row.InstallationID,
-		OctoUid:        row.OctoUid,
+		ChannelType:    string(TypeOcto),
+		ChannelUserID:  row.ChannelUserID,
+		Config:         []byte("{}"),
 	})
 	if err != nil {
 		// pgx.ErrNoRows: the conflict row exists but points at a different
@@ -116,8 +119,10 @@ func (s *BindingTokenService) RedeemAndBind(ctx context.Context, raw string, mul
 		if errors.Is(err, pgx.ErrNoRows) {
 			return RedeemedBindingToken{}, ErrBindingAlreadyAssigned
 		}
-		// 23503 = foreign_key_violation against member(workspace_id, user_id):
-		// the redeemer is not a member of the token's workspace.
+		// 23503 = foreign_key_violation. The generic channel_user_binding has no
+		// member FK (MUL-3515 §4 dropped cascades), so membership is enforced in
+		// the identity check, not here — but keep the mapping in case a deployment
+		// re-adds the composite FK.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			return RedeemedBindingToken{}, ErrBindingNotWorkspaceMember
@@ -131,7 +136,7 @@ func (s *BindingTokenService) RedeemAndBind(ctx context.Context, raw string, mul
 	return RedeemedBindingToken{
 		WorkspaceID:    row.WorkspaceID,
 		InstallationID: row.InstallationID,
-		OctoUID:        UID(row.OctoUid),
+		OctoUID:        UID(row.ChannelUserID),
 	}, nil
 }
 

@@ -409,14 +409,6 @@ func main() {
 		go h.ChannelSupervisor.Run(sweepCtx)
 	}
 
-	// Octo inbound supervisor: holds the WS lease per installation and runs
-	// the im.Socket connection for each. Nil when MULTICA_OCTO_SECRET_KEY is
-	// unset. Bound to sweepCtx; the Hub winds down (and releases its leases)
-	// when sweepCtx is cancelled during graceful shutdown.
-	if h.OctoHub != nil {
-		go h.OctoHub.Run(sweepCtx)
-	}
-
 	// MUL-2957: DB-backed execution scheduler. The scheduler turns the
 	// `sys_cron_executions` table into the distributed lease + audit
 	// log for internal periodic jobs. The first job is
@@ -529,17 +521,6 @@ func main() {
 		}
 		if h.ChannelRouter != nil {
 			h.ChannelRouter.Drain()
-		}
-	}
-
-	// Mirror the Lark join: wait for Octo supervisors to release their WS
-	// leases before exit, so the next replica can take over immediately instead
-	// of waiting out the full LeaseTTL.
-	if h.OctoHub != nil {
-		if !h.OctoHub.WaitWithTimeout(h.OctoHub.ShutdownTimeout()) {
-			slog.Warn("octo hub: supervisors did not exit within shutdown timeout; proceeding",
-				"timeout", h.OctoHub.ShutdownTimeout().String(),
-			)
 		}
 	}
 
