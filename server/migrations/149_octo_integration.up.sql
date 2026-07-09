@@ -2,6 +2,22 @@
 -- inbound dedup + drop audit, outbound message mapping, and short-lived member
 -- binding tokens.
 --
+-- RENUMBER NOTE (v0.3.41 upstream sync): this file was renamed 120 -> 149 to
+-- order after upstream's new 127-148. The migrate runner keys schema_migrations
+-- by full filename, so a database that already applied the OLD name
+-- (120_octo_integration, and 121-123 for the webhook siblings) would treat 149
+-- as unapplied and re-run this CREATE TABLE -> 42P07 duplicate_table. FRESH
+-- deploys are unaffected. Existing deployments must relabel the recorded
+-- versions BEFORE migrating (idempotent, safe to re-run):
+--
+--   UPDATE schema_migrations SET version='149_octo_integration'                     WHERE version='120_octo_integration';
+--   UPDATE schema_migrations SET version='150_webhook_subscription'                 WHERE version='121_webhook_subscription';
+--   UPDATE schema_migrations SET version='151_outbound_webhook_delivery'            WHERE version='122_outbound_webhook_delivery';
+--   UPDATE schema_migrations SET version='152_webhook_subscription_failure_tracking' WHERE version='123_webhook_subscription_failure_tracking';
+--
+-- This mirrors the prior 119 -> 120 Octo renumber (commit 80638cf1d), whose
+-- ops note established the same relabel-in-place pattern.
+--
 -- This mirrors the Lark integration (migration 109) structurally, with these
 -- Octo-specific differences:
 --   * Octo authenticates with a single bot token (bf_*), not an app_id +
