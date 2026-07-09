@@ -3,7 +3,6 @@ package octo
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,7 +14,7 @@ import (
 
 // InstallationParams carries the inputs to create or update an Octo bot
 // installation. BotToken is the plaintext bf_* token; it is encrypted at rest
-// via secretbox before storage and never persisted in the clear.
+// via secretbox inside the config blob before storage and never persisted clear.
 type InstallationParams struct {
 	WorkspaceID     pgtype.UUID
 	AgentID         pgtype.UUID
@@ -28,8 +27,9 @@ type InstallationParams struct {
 	InstallerUserID pgtype.UUID
 }
 
-// InstallationService manages octo_installation rows, encrypting the bot token
-// at rest with a secretbox.Box. It also satisfies the outbound TokenDecryptor
+// InstallationService manages Octo rows on the generalized channel_installation
+// table (channel_type='octo'), sealing the bot token at rest inside the config
+// blob with a secretbox.Box. It also satisfies the outbound TokenDecryptor
 // interface (DecryptBotToken).
 type InstallationService struct {
 	queries *db.Queries
@@ -46,77 +46,74 @@ func NewInstallationService(queries *db.Queries, box *secretbox.Box) (*Installat
 	return &InstallationService{queries: queries, box: box}, nil
 }
 
-// Upsert creates or refreshes the (workspace, agent) installation, sealing the
-// bot token before write.
-func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) (db.OctoInstallation, error) {
+// Upsert creates or refreshes the installation, keyed by robot_id in the routing
+// slot (config->>'app_id'). The (channel_type, config->>'app_id') unique index
+// guarantees one Octo bot maps to exactly one row deployment-wide.
+func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) (db.ChannelInstallation, error) {
 	if err := validateInstallationParams(p); err != nil {
-		return db.OctoInstallation{}, err
+		return db.ChannelInstallation{}, err
 	}
-	sealed, err := s.box.Seal([]byte(p.BotToken))
+	config, err := encodeConfig(s.box, p)
 	if err != nil {
-		return db.OctoInstallation{}, fmt.Errorf("seal bot token: %w", err)
+		return db.ChannelInstallation{}, err
 	}
-	inst, err := s.queries.UpsertOctoInstallation(ctx, db.UpsertOctoInstallationParams{
-		WorkspaceID:       p.WorkspaceID,
-		AgentID:           p.AgentID,
-		BotTokenEncrypted: sealed,
-		RobotID:           p.RobotID,
-		BotName:           p.BotName,
-		OwnerUid:          p.OwnerUID,
-		ApiUrl:            p.APIURL,
-		WsUrl:             p.WSURL,
-		InstallerUserID:   p.InstallerUserID,
+	inst, err := s.queries.UpsertChannelInstallation(ctx, db.UpsertChannelInstallationParams{
+		WorkspaceID:     p.WorkspaceID,
+		AgentID:         p.AgentID,
+		ChannelType:     string(TypeOcto),
+		Config:          config,
+		InstallerUserID: p.InstallerUserID,
 	})
 	if err != nil {
-		// The upsert's ON CONFLICT only covers (workspace_id, agent_id) —
-		// re-configuring the same agent. Binding a bot whose robot_id is already
-		// in use by a DIFFERENT agent/workspace falls through to an INSERT that
-		// trips the global UNIQUE(robot_id) constraint (23505). Surface that as a
-		// typed error so the handler can return 409 + a clear message instead of
-		// a generic 500.
+		// Conflict target is (workspace_id, agent_id, channel_type), so
+		// re-configuring the SAME agent updates in place. Binding a bot whose
+		// robot_id is already in use by a DIFFERENT agent falls through to an
+		// INSERT that trips the (channel_type, config->>'app_id') unique index
+		// (23505); surface it as a typed error so the handler returns 409.
 		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "octo_installation_robot_id_key" {
-			return db.OctoInstallation{}, ErrRobotAlreadyBound
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return db.ChannelInstallation{}, ErrRobotAlreadyBound
 		}
-		return db.OctoInstallation{}, err
+		return db.ChannelInstallation{}, err
 	}
 	return inst, nil
 }
 
 // ErrRobotAlreadyBound is returned by Upsert when the bot's robot_id is already
-// bound to a different agent (the UNIQUE(robot_id) constraint is deployment-wide:
+// bound to a different agent (the routing-key unique index is deployment-wide:
 // one Octo bot maps to exactly one Multica agent). Translated to 409 at the HTTP
 // boundary. The fix is to revoke the existing installation first.
 var ErrRobotAlreadyBound = errors.New("octo bot is already bound to another agent")
 
-// Revoke marks an installation revoked; the hub tears down its WS on the next
-// sweep.
+// Revoke marks an installation revoked; the supervisor tears down its WS on the
+// next sweep.
 func (s *InstallationService) Revoke(ctx context.Context, id pgtype.UUID) error {
-	return s.queries.SetOctoInstallationStatus(ctx, db.SetOctoInstallationStatusParams{
+	return s.queries.SetChannelInstallationStatus(ctx, db.SetChannelInstallationStatusParams{
 		ID:     id,
 		Status: string(InstallationRevoked),
 	})
 }
 
-// DecryptBotToken returns the plaintext bot token for an installation. It
-// satisfies the outbound TokenDecryptor interface.
-func (s *InstallationService) DecryptBotToken(inst db.OctoInstallation) (string, error) {
-	plain, err := s.box.Open(inst.BotTokenEncrypted)
+// DecryptBotToken returns the plaintext bot token for an installation, reading it
+// from the config blob. It satisfies the outbound TokenDecryptor interface.
+func (s *InstallationService) DecryptBotToken(inst db.ChannelInstallation) (string, error) {
+	creds, err := decodeCredentials(inst.Config, boxDecrypter(s.box))
 	if err != nil {
-		return "", fmt.Errorf("open bot token: %w", err)
+		return "", err
 	}
-	return string(plain), nil
+	return creds.BotToken, nil
 }
 
-// GetInWorkspace loads a workspace-scoped installation (HTTP handler path).
+// GetInWorkspace loads a workspace-scoped Octo installation (HTTP handler path).
 // Returns ErrInstallationNotFound when no matching row exists.
-func (s *InstallationService) GetInWorkspace(ctx context.Context, id, workspaceID pgtype.UUID) (db.OctoInstallation, error) {
-	inst, err := s.queries.GetOctoInstallationInWorkspace(ctx, db.GetOctoInstallationInWorkspaceParams{
+func (s *InstallationService) GetInWorkspace(ctx context.Context, id, workspaceID pgtype.UUID) (db.ChannelInstallation, error) {
+	inst, err := s.queries.GetChannelInstallationInWorkspace(ctx, db.GetChannelInstallationInWorkspaceParams{
 		ID:          id,
 		WorkspaceID: workspaceID,
+		ChannelType: string(TypeOcto),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return db.OctoInstallation{}, ErrInstallationNotFound
+		return db.ChannelInstallation{}, ErrInstallationNotFound
 	}
 	return inst, err
 }
@@ -125,9 +122,12 @@ func (s *InstallationService) GetInWorkspace(ctx context.Context, id, workspaceI
 // installation row exists for the (id, workspace) pair.
 var ErrInstallationNotFound = errors.New("octo installation not found")
 
-// ListByWorkspace lists a workspace's installations (HTTP handler path).
-func (s *InstallationService) ListByWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]db.OctoInstallation, error) {
-	return s.queries.ListOctoInstallationsByWorkspace(ctx, workspaceID)
+// ListByWorkspace lists a workspace's Octo installations (HTTP handler path).
+func (s *InstallationService) ListByWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]db.ChannelInstallation, error) {
+	return s.queries.ListChannelInstallationsByWorkspace(ctx, db.ListChannelInstallationsByWorkspaceParams{
+		WorkspaceID: workspaceID,
+		ChannelType: string(TypeOcto),
+	})
 }
 
 func validateInstallationParams(p InstallationParams) error {

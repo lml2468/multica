@@ -441,42 +441,39 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			slog.Info("octo integration enabled")
 
 			// Outbound: relay chat:done / task:failed back to Octo.
-			patcher := octo.NewPatcher(queries, installSvc, octo.NewMessageSender(), slog.Default())
-			patcher.Register(bus)
-
-			// Inbound: audit + chat-session service + dispatcher.
-			dispatcher := &octo.Dispatcher{
-				Queries:     queries,
-				Chat:        octo.NewChatSessionService(queries, pool),
-				TaskService: h.TaskService,
-				Audit:       octo.NewAuditLogger(queries),
-				Logger:      slog.Default(),
-			}
-
-			// WS hub: per-installation lease + transport.Socket connection.
-			connectorFactory := octo.NewConnectorFactory(installSvc, slog.Default())
-			h.OctoHub = octo.NewHub(queries, connectorFactory, dispatcher, octo.HubConfig{}, slog.Default())
+			octoSender := octo.NewMessageSender()
+			octo.NewPatcher(queries, installSvc, octoSender, slog.Default()).Register(bus)
 
 			// Outbound replier for the synchronous outcomes: DM an unbound
 			// sender a binding link, or notify the user when the agent is
-			// offline/archived. Reuses the same MessageSender + token
-			// decryptor as the Patcher. PublicURL drives the clickable
+			// offline/archived. Reuses the same MessageSender + token decryptor
+			// as the Patcher. PublicURL drives the clickable
 			// {PublicURL}/octo/bind?token= link.
-			h.OctoHub.SetOutcomeReplier(octo.NewOutcomeReplier(octo.OutcomeReplierConfig{
+			octoReplier := octo.NewOutcomeReplier(octo.OutcomeReplierConfig{
+				Loader:    queries,
 				Minter:    h.OctoBindingTokens,
 				Decryptor: installSvc,
-				Sender:    octo.NewMessageSender(),
+				Sender:    octoSender,
 				PublicURL: signupConfig.PublicURL,
 				Logger:    slog.Default(),
-			}))
-			// Make the binding-link capability explicit in boot output: without
-			// MULTICA_PUBLIC_URL the replier still runs but cannot produce a
-			// clickable bind link, so unbound users silently can't self-serve.
+			})
 			if signupConfig.PublicURL == "" {
 				slog.Warn("octo: MULTICA_PUBLIC_URL not set; unbound users will NOT receive a clickable binding link")
 			} else {
 				slog.Info("octo: binding links enabled", "public_url", signupConfig.PublicURL)
 			}
+
+			// Inbound: register the ResolverSet on the shared engine Router and
+			// the per-installation Factory on the shared Registry, so the
+			// ChannelSupervisor builds + supervises one octoChannel per active
+			// Octo installation — the same contract as Feishu and Slack, no
+			// separate hub. Octo inherits /issue + run-debounce for free.
+			channelRouter.Register(octo.TypeOcto, octo.NewOctoResolverSet(queries, pool, octoReplier))
+			octo.RegisterOcto(channelRegistry, octo.ChannelDeps{
+				Decrypt: box.Open,
+				Sender:  octoSender,
+				Logger:  slog.Default(),
+			})
 			slog.Info("octo inbound pipeline wired")
 		}
 	} else {

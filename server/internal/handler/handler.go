@@ -197,10 +197,10 @@ type Handler struct {
 	ChannelRouter *engine.Router
 	// Octo IM integration. Nil when MULTICA_OCTO_SECRET_KEY is unset; the
 	// HTTP handlers return 503 in that case. Wired in router.go after
-	// handler.New. OctoHub is constructed by the router but started by main.go.
+	// handler.New. Octo runs on the shared ChannelSupervisor / ChannelRouter
+	// (registered in router.go), so there is no separate hub to start.
 	OctoInstallations *octo.InstallationService
 	OctoBindingTokens *octo.BindingTokenService
-	OctoHub           *octo.Hub
 	// OctoAPIBaseURL is the default Octo REST base (MULTICA_OCTO_API_URL),
 	// used by CreateOctoInstallation when the request omits api_url.
 	OctoAPIBaseURL string

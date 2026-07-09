@@ -52,16 +52,16 @@ func TestOctoCleanupHandler_PurgesExpiredAndStale(t *testing.T) {
 		t.Fatalf("handler: %v", err)
 	}
 
-	if n := scalarInt(t, pool, `SELECT count(*) FROM octo_binding_token WHERE installation_id=$1`, instID); n != 1 {
+	if n := scalarInt(t, pool, `SELECT count(*) FROM channel_binding_token WHERE installation_id=$1`, instID); n != 1 {
 		t.Errorf("binding tokens after purge = %d, want 1 (only the fresh one)", n)
 	}
-	if scalarInt(t, pool, `SELECT count(*) FROM octo_binding_token WHERE token_hash=$1`, freshHash) != 1 {
+	if scalarInt(t, pool, `SELECT count(*) FROM channel_binding_token WHERE token_hash=$1`, freshHash) != 1 {
 		t.Error("fresh token was wrongly purged")
 	}
-	if n := scalarInt(t, pool, `SELECT count(*) FROM octo_inbound_dedup WHERE installation_id=$1`, instID); n != 1 {
+	if n := scalarInt(t, pool, `SELECT count(*) FROM channel_inbound_message_dedup WHERE installation_id=$1`, instID); n != 1 {
 		t.Errorf("dedup rows after purge = %d, want 1 (only the recent one)", n)
 	}
-	if scalarInt(t, pool, `SELECT count(*) FROM octo_inbound_dedup WHERE installation_id=$1 AND message_id=$2`, instID, newMsg) != 1 {
+	if scalarInt(t, pool, `SELECT count(*) FROM channel_inbound_message_dedup WHERE installation_id=$1 AND message_id=$2`, instID, newMsg) != 1 {
 		t.Error("recent dedup row was wrongly purged")
 	}
 
@@ -70,7 +70,8 @@ func TestOctoCleanupHandler_PurgesExpiredAndStale(t *testing.T) {
 }
 
 // octoCleanupFixture creates a workspace + user + membership + runtime + agent +
-// installation the binding-token/dedup rows can reference, with cleanup.
+// channel installation (channel_type='octo') the binding-token/dedup rows can
+// reference, with cleanup.
 func octoCleanupFixture(t *testing.T, pool *pgxpool.Pool) (wsID, userID, instID pgtype.UUID) {
 	t.Helper()
 	ctx := context.Background()
@@ -97,8 +98,8 @@ func octoCleanupFixture(t *testing.T, pool *pgxpool.Pool) (wsID, userID, instID 
 		t.Fatalf("create agent: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO octo_installation (workspace_id, agent_id, bot_token_encrypted, robot_id, api_url, installer_user_id)
-		 VALUES ($1,$2,'\x00','robot_cleanup_'||substr(md5(random()::text),1,8),'https://im.example/api',$3) RETURNING id`,
+		`INSERT INTO channel_installation (workspace_id, agent_id, channel_type, config, installer_user_id)
+		 VALUES ($1,$2,'octo', jsonb_build_object('app_id','robot_cleanup_'||substr(md5(random()::text),1,8),'api_url','https://im.example/api'), $3) RETURNING id`,
 		wsID, agentID, userID).Scan(&instID); err != nil {
 		t.Fatalf("create installation: %v", err)
 	}
@@ -108,7 +109,7 @@ func octoCleanupFixture(t *testing.T, pool *pgxpool.Pool) (wsID, userID, instID 
 func insertBindingToken(t *testing.T, pool *pgxpool.Pool, hash string, wsID, instID pgtype.UUID, uid string, expiresAt time.Time) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO octo_binding_token (token_hash, workspace_id, installation_id, octo_uid, expires_at) VALUES ($1,$2,$3,$4,$5)`,
+		`INSERT INTO channel_binding_token (token_hash, workspace_id, installation_id, channel_type, channel_user_id, expires_at) VALUES ($1,$2,$3,'octo',$4,$5)`,
 		hash, wsID, instID, uid, expiresAt); err != nil {
 		t.Fatalf("insert binding token: %v", err)
 	}
@@ -117,7 +118,7 @@ func insertBindingToken(t *testing.T, pool *pgxpool.Pool, hash string, wsID, ins
 func insertDedup(t *testing.T, pool *pgxpool.Pool, instID pgtype.UUID, msgID string, receivedAt time.Time) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO octo_inbound_dedup (installation_id, message_id, received_at, claim_token) VALUES ($1,$2,$3,gen_random_uuid())`,
+		`INSERT INTO channel_inbound_message_dedup (installation_id, message_id, received_at, claim_token) VALUES ($1,$2,$3,gen_random_uuid())`,
 		instID, msgID, receivedAt); err != nil {
 		t.Fatalf("insert dedup: %v", err)
 	}
