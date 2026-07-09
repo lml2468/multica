@@ -629,6 +629,59 @@ func TestRunOctoWebhookRenumberHookFreshInstall(t *testing.T) {
 	}
 }
 
+// TestConstraintReconcileAfter149Skip is the regression test for the P1 that
+// yujiawei reproduced: on the upgrade path the renumber hook makes 149's SQL
+// skip wholesale, and 149's SQL is the only place that re-adds 'octo_chat'. With
+// upstream's 131 running first (dropping the constraint down to the slack-aware
+// set), the skip would leave the upgraded DB WITHOUT 'octo_chat' — diverging
+// from a fresh install. Migration 153 exists to restore it unconditionally.
+//
+// This test reproduces the post-131, 149-skipped state (an `issue` table whose
+// origin_type CHECK carries the 4-value set without 'octo_chat'), runs 153's
+// real SQL, and asserts the constraint is back to the full 5-value union.
+func TestConstraintReconcileAfter149Skip(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), raceTestTimeout)
+	defer cancel()
+
+	issueFQN := pgx.Identifier{f.schema, "issue"}.Sanitize()
+
+	// Reproduce the state after 131 ran and 149 was skipped: an issue table whose
+	// constraint is the post-131 slack-aware set, WITHOUT octo_chat.
+	if _, err := f.pool.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (
+			id BIGSERIAL PRIMARY KEY,
+			origin_type TEXT NOT NULL DEFAULT 'quick_create',
+			CONSTRAINT issue_origin_type_check
+				CHECK (origin_type IN ('autopilot','quick_create','lark_chat','slack_chat'))
+		)`, issueFQN)); err != nil {
+		t.Fatalf("seed issue table (post-131 state): %v", err)
+	}
+
+	// Sanity: octo_chat is rejected before 153.
+	if _, err := f.pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (origin_type) VALUES ('octo_chat')`, issueFQN)); err == nil {
+		t.Fatalf("expected octo_chat to be rejected before 153 ran, but insert succeeded")
+	}
+
+	// Apply 153's real SQL, retargeted at the per-test issue table (the shipped
+	// file names the unqualified `issue`; rewrite to the sandbox schema).
+	real153, err := os.ReadFile(filepath.Join("..", "..", "migrations", "153_issue_origin_type_union.up.sql"))
+	if err != nil {
+		t.Fatalf("read 153 migration: %v", err)
+	}
+	sql := strings.ReplaceAll(string(real153), "ALTER TABLE issue ", "ALTER TABLE "+issueFQN+" ")
+	if _, err := f.pool.Exec(ctx, sql); err != nil {
+		t.Fatalf("apply 153: %v", err)
+	}
+
+	// After 153: octo_chat (and slack_chat) must both be accepted.
+	for _, ot := range []string{"octo_chat", "slack_chat", "lark_chat", "autopilot", "quick_create"} {
+		if _, err := f.pool.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (origin_type) VALUES ($1)`, issueFQN), ot); err != nil {
+			t.Fatalf("origin_type %q rejected after 153 (constraint reconcile failed): %v", ot, err)
+		}
+	}
+}
+
 // TestRunMigrationsRejectsInvalidDirection pins the direction
 // whitelist contract: anything other than "up" or "down" must error
 // before runMigrations touches the pool. This prevents the subtle bug
