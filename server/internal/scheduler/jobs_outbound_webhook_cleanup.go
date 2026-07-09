@@ -24,7 +24,7 @@ const outboundWebhookDeliveryRetention = 30 * 24 * time.Hour
 
 // OutboundWebhookDeliveryCleanupJob returns the JobSpec that purges outbound
 // webhook delivery-history rows older than the retention window. Without it the
-// outbound_webhook_delivery table (migration 122) would grow unbounded — the
+// outbound_webhook_delivery table (migration 151) would grow unbounded — the
 // dispatcher writes one row per delivery and never deletes.
 func OutboundWebhookDeliveryCleanupJob(pool *pgxpool.Pool) JobSpec {
 	return JobSpec{

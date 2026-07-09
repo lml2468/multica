@@ -20,8 +20,10 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/runtimeapps"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -267,6 +269,70 @@ func normalizeProvider(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+// inheritMachineCustomName gives a freshly-inserted runtime the machine's
+// shared custom name (MUL-4217) when the machine is already named, so adding a
+// provider — or recording a failed custom-runtime profile — on a named machine
+// doesn't leave a custom_name = NULL row that makes the machine title revert to
+// its hostname. Both the normal runtime path and the failed-profile path write
+// daemon_id-scoped rows that show up in the machine grouping, so both call this.
+//
+// Only fresh inserts with no name of their own and a daemon_id participate;
+// existing rows keep whatever they already have. A lookup/update error is
+// non-fatal — registration must still succeed — so the input row is returned
+// unchanged on any failure.
+func (h *Handler) inheritMachineCustomName(ctx context.Context, rt db.AgentRuntime, inserted bool) db.AgentRuntime {
+	if !inserted || rt.CustomName.Valid || !rt.DaemonID.Valid {
+		return rt
+	}
+	names, err := h.Queries.ListDaemonCustomNames(ctx, db.ListDaemonCustomNamesParams{
+		WorkspaceID: rt.WorkspaceID,
+		DaemonID:    rt.DaemonID,
+		ExcludeID:   rt.ID,
+	})
+	if err != nil {
+		return rt
+	}
+	shared, ok := sharedDaemonCustomName(names)
+	if !ok {
+		return rt
+	}
+	updated, err := h.Queries.UpdateAgentRuntimeCustomName(ctx, db.UpdateAgentRuntimeCustomNameParams{
+		CustomName: pgtype.Text{String: shared, Valid: true},
+		ID:         rt.ID,
+	})
+	if err != nil {
+		return rt
+	}
+	return updated
+}
+
+// sharedDaemonCustomName returns the machine-level name shared by all of a
+// daemon's runtimes — the same rule the frontend's sharedCustomName applies:
+// every runtime must carry the identical non-empty custom_name. Returns
+// ("", false) when the set is empty, any runtime is unnamed, or the names
+// disagree (i.e. there is no single machine name to inherit).
+func sharedDaemonCustomName(names []pgtype.Text) (string, bool) {
+	if len(names) == 0 {
+		return "", false
+	}
+	var first string
+	for i, n := range names {
+		if !n.Valid {
+			return "", false
+		}
+		v := strings.TrimSpace(n.String)
+		if v == "" {
+			return "", false
+		}
+		if i == 0 {
+			first = v
+		} else if v != first {
+			return "", false
+		}
+	}
+	return first, true
+}
+
 func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 	var req DaemonRegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -407,6 +473,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				WorkspaceID:    prow.WorkspaceID,
 				DaemonID:       prow.DaemonID,
 				Name:           prow.Name,
+				CustomName:     prow.CustomName,
 				RuntimeMode:    prow.RuntimeMode,
 				Provider:       prow.Provider,
 				Status:         prow.Status,
@@ -451,6 +518,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				WorkspaceID:    row.WorkspaceID,
 				DaemonID:       row.DaemonID,
 				Name:           row.Name,
+				CustomName:     row.CustomName,
 				RuntimeMode:    row.RuntimeMode,
 				Provider:       row.Provider,
 				Status:         row.Status,
@@ -465,6 +533,11 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 				ProfileID:      row.ProfileID,
 			}
 		}
+
+		// A brand-new runtime on an already-named machine inherits the machine's
+		// shared custom name so the machine title stays stable as providers come
+		// and go (MUL-4217). Shared with the failed-profile path below.
+		registered = h.inheritMachineCustomName(r.Context(), registered, inserted)
 
 		// Inserted is false for normal daemon reconnects/upserts, so
 		// runtime_ready is a first-ready-per-runtime-row signal.
@@ -544,7 +617,7 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			"runtime_profile_failure_reason":     reason,
 			"command_name":                       commandName,
 		})
-		if _, err := h.Queries.UpsertAgentRuntimeWithProfile(r.Context(), db.UpsertAgentRuntimeWithProfileParams{
+		prow, err := h.Queries.UpsertAgentRuntimeWithProfile(r.Context(), db.UpsertAgentRuntimeWithProfileParams{
 			WorkspaceID: wsUUID,
 			DaemonID:    strToText(req.DaemonID),
 			Name:        name,
@@ -555,11 +628,21 @@ func (h *Handler) DaemonRegister(w http.ResponseWriter, r *http.Request) {
 			Metadata:    metadata,
 			OwnerID:     ownerID,
 			ProfileID:   profileUUID,
-		}); err != nil {
+		})
+		if err != nil {
 			slog.Warn("failed to record runtime profile registration failure",
 				"workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID,
 				"profile_id", profileID, "error", err)
+			continue
 		}
+		// Keep the failed-profile row consistent with the machine's name so it
+		// doesn't drag the machine title back to the hostname (MUL-4217).
+		h.inheritMachineCustomName(r.Context(), db.AgentRuntime{
+			ID:          prow.ID,
+			WorkspaceID: prow.WorkspaceID,
+			DaemonID:    prow.DaemonID,
+			CustomName:  prow.CustomName,
+		}, prow.Inserted)
 	}
 
 	slog.Info("daemon registered", "workspace_id", req.WorkspaceID, "daemon_id", req.DaemonID, "runtimes_count", len(resp))
@@ -1228,6 +1311,22 @@ func requestHasDaemonCapability(r *http.Request, capability string) bool {
 	return false
 }
 
+func parseRuntimeConnectedAppsForClaim(raw []byte, taskID pgtype.UUID) []runtimeapps.ConnectedApp {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var apps []runtimeapps.ConnectedApp
+	if err := json.Unmarshal(raw, &apps); err != nil {
+		slog.Warn("daemon claim: unmarshal runtime_connected_apps failed",
+			"task_id", uuidToString(taskID),
+			"error", err,
+		)
+		return nil
+	}
+	return apps
+}
+
 // ClaimTaskByRuntime atomically claims the next queued task for a runtime.
 // The response includes the agent's name and skills, fetched fresh from the DB.
 func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
@@ -1286,6 +1385,10 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp := taskToResponse(*task, runtimeWorkspaceID)
+	composioMCPEnabled := h.composioMCPAppsEnabled(r.Context())
+	if composioMCPEnabled {
+		resp.ConnectedApps = parseRuntimeConnectedAppsForClaim(task.RuntimeConnectedApps, task.ID)
+	}
 	if agent, err := h.Queries.GetAgent(r.Context(), task.AgentID); err == nil {
 		useSkillRefs := requestHasDaemonCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
 		var customEnv map[string]string
@@ -1303,6 +1406,19 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		var mcpConfig json.RawMessage
 		if agent.McpConfig != nil {
 			mcpConfig = json.RawMessage(agent.McpConfig)
+		}
+		// Layer the per-task overlay (set at enqueue from the initiator
+		// user's active integrations — currently Composio) on top of the
+		// agent's saved mcp_config. Overlay wins on server-name collisions
+		// because it carries the live user-scoped session URL. Errors are
+		// logged but never fail the claim: a broken overlay must not prevent
+		// the agent from running with its base config.
+		if composioMCPEnabled && len(task.RuntimeMcpOverlay) > 0 {
+			if merged, err := mergeMCPOverlay(mcpConfig, json.RawMessage(task.RuntimeMcpOverlay)); err != nil {
+				slog.Warn("daemon claim: merge runtime_mcp_overlay failed; falling back to agent mcp_config", "task_id", uuidToString(task.ID), "error", err)
+			} else {
+				mcpConfig = merged
+			}
 		}
 		// runtime_config is stored as JSONB and may legitimately be the
 		// empty object `{}` for agents that haven't opted into any
@@ -1594,6 +1710,38 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			resp.WorkspaceID = uuidToString(cs.WorkspaceID)
 			resp.ChatSessionID = uuidToString(cs.ID)
 			resp.ThreadName = cs.Title
+			// An is_agent_intro session carries no user message: the agent opens
+			// the conversation by introducing itself. Flag it so the daemon builds
+			// a self-introduction prompt rather than a "reply to their message"
+			// prompt (MUL-4230). The is_agent_intro column stays true for the
+			// session's whole life, so gate the intro prompt on the session still
+			// having zero human messages — otherwise every follow-up turn after the
+			// creator replies would re-run the "introduce yourself" prompt and the
+			// agent keeps repeating the same introduction (MUL-4259).
+			if cs.IsAgentIntro {
+				if hasUser, herr := h.Queries.ChatSessionHasUserMessage(r.Context(), cs.ID); herr != nil {
+					slog.Warn("chat intro gate: has-user-message check failed",
+						"chat_session_id", uuidToString(cs.ID), "error", herr)
+				} else {
+					resp.ChatIntro = !hasUser
+				}
+			}
+			// Flag a channel-backed session so the daemon makes the agent aware
+			// it is operating inside Slack — read this conversation's history
+			// from the channel via `multica chat history` / `multica chat thread`,
+			// not from Multica (MUL-3871). Empty for a web-only chat session.
+			// ChatInThread tells the agent which command to start with: the
+			// latest trigger was a thread reply iff its reply-target thread
+			// (last_thread_id) differs from its own message id (a top-level
+			// @mention records its own ts as both).
+			if binding, berr := h.Queries.GetChannelChatSessionBindingBySession(r.Context(), db.GetChannelChatSessionBindingBySessionParams{
+				ChatSessionID: cs.ID,
+				ChannelType:   string(slack.TypeSlack),
+			}); berr == nil {
+				resp.ChatChannelType = string(slack.TypeSlack)
+				resp.ChatInThread = binding.LastThreadID.Valid && binding.LastThreadID.String != "" &&
+					binding.LastThreadID.String != binding.LastMessageID.String
+			}
 			if ws, err := h.Queries.GetWorkspace(r.Context(), cs.WorkspaceID); err == nil && ws.Repos != nil {
 				var repos []RepoData
 				if json.Unmarshal(ws.Repos, &repos) == nil && len(repos) > 0 {
@@ -2331,6 +2479,24 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.TaskService.CaptureTaskUsage(r.Context(), task, provider, u.Model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
+
+		// Surface prompt-cache effectiveness per run so cache hit rates are
+		// observable in logs, not just queryable from runtime_usage. The ratio
+		// is cached input over total input-side tokens; a persistently low
+		// value flags a prompt prefix that is not being reused across runs
+		// (e.g. volatile values poisoning the cacheable prefix). MUL-3887.
+		if totalInput := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens; totalInput > 0 {
+			slog.Info("task prompt-cache usage",
+				"task_id", taskID,
+				"provider", provider,
+				"model", u.Model,
+				"input_tokens", u.InputTokens,
+				"output_tokens", u.OutputTokens,
+				"cache_read_tokens", u.CacheReadTokens,
+				"cache_write_tokens", u.CacheWriteTokens,
+				"cache_read_ratio", float64(u.CacheReadTokens)/float64(totalInput),
+			)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

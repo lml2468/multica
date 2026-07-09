@@ -30,7 +30,10 @@ SELECT
   ), '')::text AS last_run_status
 FROM autopilot a
 WHERE a.workspace_id = $1
-  AND (sqlc.narg('status')::text IS NULL OR a.status = sqlc.narg('status'))
+  AND (
+    (sqlc.narg('status')::text IS NULL AND a.status <> 'archived')
+    OR a.status = sqlc.narg('status')
+  )
 ORDER BY a.created_at DESC;
 
 -- name: GetAutopilot :one
@@ -66,8 +69,10 @@ UPDATE autopilot SET
 WHERE id = $1
 RETURNING *;
 
--- name: DeleteAutopilot :exec
-DELETE FROM autopilot WHERE id = $1;
+-- name: ArchiveAutopilot :exec
+UPDATE autopilot
+SET status = 'archived', updated_at = now()
+WHERE id = $1;
 
 -- name: UpdateAutopilotLastRunAt :exec
 UPDATE autopilot SET last_run_at = now(), updated_at = now()
@@ -413,3 +418,41 @@ ON CONFLICT (autopilot_id, user_type, user_id) DO NOTHING;
 DELETE FROM autopilot_subscriber
 WHERE autopilot_id = $1;
 
+-- =====================
+-- Autopilot Collaborators
+-- =====================
+
+-- name: ListAutopilotCollaborators :many
+-- ORDER BY created_at keeps row rendering stable across refreshes.
+SELECT * FROM autopilot_collaborator
+WHERE autopilot_id = $1
+ORDER BY created_at ASC, user_id ASC;
+
+-- name: AddAutopilotCollaborator :one
+-- Re-granting an existing collaborator is a no-op that refreshes granted_by,
+-- so the call is idempotent from the API boundary.
+INSERT INTO autopilot_collaborator (autopilot_id, user_type, user_id, granted_by)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (autopilot_id, user_type, user_id)
+    DO UPDATE SET granted_by = EXCLUDED.granted_by
+RETURNING *;
+
+-- name: DeleteAutopilotCollaborator :exec
+DELETE FROM autopilot_collaborator
+WHERE autopilot_id = $1 AND user_type = $2 AND user_id = $3;
+
+-- name: DeleteAutopilotCollaboratorsForAutopilot :exec
+-- Application-layer cleanup run inside the autopilot delete transaction.
+DELETE FROM autopilot_collaborator
+WHERE autopilot_id = $1;
+
+-- name: IsAutopilotCollaborator :one
+SELECT EXISTS (
+    SELECT 1 FROM autopilot_collaborator
+    WHERE autopilot_id = $1 AND user_type = 'member' AND user_id = $2
+) AS is_collaborator;
+
+-- name: ListAutopilotIDsForCollaborator :many
+-- Powers the per-row can_write flag on the list endpoint without an N+1.
+SELECT autopilot_id FROM autopilot_collaborator
+WHERE user_type = 'member' AND user_id = $1;

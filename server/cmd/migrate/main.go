@@ -24,7 +24,12 @@ import (
 // Returning an error aborts the migration run. The corresponding
 // migration is NOT recorded in schema_migrations, so the next run will
 // retry the hook + migration.
-type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
+// preMigrationHook runs before a migration's SQL. It receives the pool (not the
+// loop's pinned conn) so it can take its own session-level locks, and the
+// already-quoted, possibly schema-qualified schema_migrations identifier so a
+// hook that reconciles bookkeeping rows writes the SAME table the runner reads
+// (production uses the unqualified default; tests use a per-schema table).
+type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool, migrationsTable string) error
 
 // preMigrationHooks wires migration version → hook. The version key is
 // the file basename without the `.up.sql` suffix, matching what
@@ -39,9 +44,63 @@ type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
 // `cmd/backfill_task_usage_hourly` exposes to operators.
 var preMigrationHooks = map[string]preMigrationHook{
 	"103_drop_legacy_daily_rollups": runTaskUsageHourlyHook,
+	"149_octo_integration":          runOctoWebhookRenumberHook,
 }
 
-func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool) error {
+// runOctoWebhookRenumberHook reconciles schema_migrations for the fork's
+// Octo/webhook migrations, which were renumbered 120-123 -> 149-152 during the
+// v0.3.41 upstream sync to order after upstream's new 127-148.
+//
+// The runner keys schema_migrations on the full filename, so a database that
+// already applied the OLD names (120_octo_integration, 121-123 webhooks) would
+// see 149-152 as unapplied and re-run their bare CREATE TABLE -> 42P07
+// duplicate_table, crashlooping the pod (the Helm entrypoint runs `migrate up`
+// automatically, so a manual relabel is never reachable). This hook runs before
+// 149's SQL and relabels the recorded versions in place, so 149-152 are then
+// seen as applied and skipped. Fresh installs never recorded 120-123, so every
+// UPDATE no-ops there. Idempotent: re-running finds nothing left to relabel.
+//
+// Mirrors the prior 119 -> 120 Octo renumber (commit 80638cf1d), whose ops note
+// established this relabel-in-place pattern — now automated so the auto-migrate
+// upgrade path self-heals instead of relying on out-of-band DB surgery.
+func runOctoWebhookRenumberHook(ctx context.Context, pool *pgxpool.Pool, migrationsTable string) error {
+	renames := []struct{ old, new string }{
+		{"120_octo_integration", "149_octo_integration"},
+		{"121_webhook_subscription", "150_webhook_subscription"},
+		{"122_outbound_webhook_delivery", "151_outbound_webhook_delivery"},
+		{"123_webhook_subscription_failure_tracking", "152_webhook_subscription_failure_tracking"},
+	}
+	relabelSQL := fmt.Sprintf(
+		`UPDATE %s SET version = $2
+		 WHERE version = $1
+		   AND NOT EXISTS (SELECT 1 FROM %s WHERE version = $2)`,
+		migrationsTable, migrationsTable)
+	dropStaleSQL := fmt.Sprintf(
+		`DELETE FROM %s WHERE version = $1
+		   AND EXISTS (SELECT 1 FROM %s WHERE version = $2)`,
+		migrationsTable, migrationsTable)
+	for _, r := range renames {
+		// Guard against the pathological case where BOTH the old and new rows
+		// exist (e.g. a half-applied prior attempt): relabel only when the new
+		// version is absent, so provenance is never clobbered.
+		tag, err := pool.Exec(ctx, relabelSQL, r.old, r.new)
+		if err != nil {
+			return fmt.Errorf("relabel %s -> %s: %w", r.old, r.new, err)
+		}
+		if tag.RowsAffected() > 0 {
+			slog.Info("octo/webhook migration relabeled", "from", r.old, "to", r.new)
+			continue
+		}
+		// New row already present (fresh install, or already relabeled): drop any
+		// leftover old row so the table doesn't carry both.
+		if _, err := pool.Exec(ctx, dropStaleSQL, r.old, r.new); err != nil {
+			return fmt.Errorf("drop stale %s after %s present: %w", r.old, r.new, err)
+		}
+	}
+	return nil
+}
+
+func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool, _ string) error {
 	res, err := taskusagebackfill.Hook(ctx, pool, taskusagebackfill.HookOptions{})
 	if err != nil {
 		return fmt.Errorf("task_usage_hourly pre-103 hook: %w", err)
@@ -265,8 +324,22 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		if opts.Direction == "up" {
 			if hook, ok := opts.Hooks[version]; ok && hook != nil {
 				slog.Info("running pre-migration hook", "version", version)
-				if err := hook(ctx, pool); err != nil {
+				if err := hook(ctx, pool, tableIdent); err != nil {
 					return fmt.Errorf("pre-migration hook for %q: %w", version, err)
+				}
+				// A hook may reconcile schema_migrations so that this
+				// version is now recorded as applied — e.g. a renumber
+				// hook that relabels an old filename to this one. The
+				// `exists` check above ran before the hook, so re-check
+				// here: if the version is now present, its SQL has
+				// effectively already been applied under the old name and
+				// must NOT be re-run (bare CREATE TABLE would 42P07).
+				if err := conn.QueryRow(ctx, existsSQL, version).Scan(&exists); err != nil {
+					return fmt.Errorf("re-check migration %q after hook: %w", version, err)
+				}
+				if exists {
+					fmt.Printf("  skip  %s (reconciled by pre-migration hook)\n", version)
+					continue
 				}
 			}
 		}

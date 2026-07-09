@@ -270,6 +270,67 @@ func TestBuildChatPromptAttachmentIDsCanBeBoundToCreatedIssues(t *testing.T) {
 	}
 }
 
+func TestBuildChatPromptChannelAwareness(t *testing.T) {
+	t.Run("slack-backed prompt teaches both read commands", func(t *testing.T) {
+		out := buildChatPrompt(Task{
+			ChatSessionID:   "sess-1",
+			ChatChannelType: "slack",
+			ChatMessage:     "你刚刚和 xxx 聊了什么",
+		})
+		for _, want := range []string{"Slack", "NOT in Multica", "multica chat history", "multica chat thread", "Do NOT narrate"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("slack-backed prompt missing %q\n--- output ---\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("top-level mention starts with history", func(t *testing.T) {
+		out := buildChatPrompt(Task{ChatSessionID: "s", ChatChannelType: "slack", ChatInThread: false, ChatMessage: "hi"})
+		if !strings.Contains(out, "top level: start with `multica chat history`") {
+			t.Fatalf("expected top-level guidance, got:\n%s", out)
+		}
+	})
+
+	t.Run("in-thread mention starts with thread", func(t *testing.T) {
+		out := buildChatPrompt(Task{ChatSessionID: "s", ChatChannelType: "slack", ChatInThread: true, ChatMessage: "hi"})
+		if !strings.Contains(out, "inside a thread: start with `multica chat thread`") {
+			t.Fatalf("expected in-thread guidance, got:\n%s", out)
+		}
+	})
+
+	t.Run("web-only session has no channel block", func(t *testing.T) {
+		out := buildChatPrompt(Task{
+			ChatSessionID: "sess-1",
+			ChatMessage:   "hi",
+		})
+		if strings.Contains(out, "multica chat history") {
+			t.Fatalf("web-only chat prompt should not mention channel history, got:\n%s", out)
+		}
+	})
+}
+
+func TestBuildChatPromptAgentIntro(t *testing.T) {
+	// The proactive self-introduction chat (MUL-4230) has no user message: the
+	// prompt must tell the agent to open the conversation itself, and must NOT
+	// carry the generic "respond to their message" framing or an empty
+	// "User message:" section that would confuse the agent.
+	out := buildChatPrompt(Task{ChatSessionID: "sess-1", ChatIntro: true})
+	for _, want := range []string{
+		"You were just created",
+		"you are opening the conversation",
+		"introduce yourself",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("intro prompt missing %q\n--- output ---\n%s", want, out)
+		}
+	}
+	for _, unwanted := range []string{"Respond to their message", "User message:"} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("intro prompt should not contain %q\n--- output ---\n%s", unwanted, out)
+		}
+	}
+}
+
 func TestBuildChatPromptSlashSkills(t *testing.T) {
 	t.Run("injects selected skills block", func(t *testing.T) {
 		task := Task{
