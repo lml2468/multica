@@ -74,6 +74,68 @@ func TestHTTPErrorKind(t *testing.T) {
 	}
 }
 
+// wafBlockBody is a trimmed-down copy of the Tencent Cloud WAF 403 block page
+// the CLI receives when a request body trips an XSS rule.
+const wafBlockBody = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" />` +
+	`<title>WAF拦截页面</title></head><body><p class="title">您的请求已中断</p>` +
+	`<p class="desc">Web应用防护服务检测您当前访问存在Web安全风险或访问不合规</p>` +
+	`<p class="title">腾讯云WAF</p><p class="desc">访问拦截</p></body></html>`
+
+func TestIsWAFBlockPage(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"tencent waf 403 page", wafBlockBody, true},
+		{"generic english firewall page", `<html><body>Request blocked by Web Application Firewall</body></html>`, true},
+		{"empty", "", false},
+		{"api json 403", `{"error":"forbidden"}`, false},
+		{"api json with html-ish text", `{"error":"<html> is not allowed"}`, false},
+		{"unrelated html gateway 502", `<!DOCTYPE html><html><body>502 Bad Gateway</body></html>`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isWAFBlockPage(tc.body); got != tc.want {
+				t.Errorf("isWAFBlockPage(%q) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHTTPErrorKindWAFBlock asserts a WAF block page is classified as
+// KindContentBlocked regardless of the (WAF-chosen) status code, while a
+// genuine API 403 stays KindForbidden.
+func TestHTTPErrorKindWAFBlock(t *testing.T) {
+	waf := &HTTPError{StatusCode: 403, Body: wafBlockBody}
+	if got := waf.Kind(); got != KindContentBlocked {
+		t.Errorf("WAF block page Kind() = %d, want KindContentBlocked", got)
+	}
+	apiForbidden := &HTTPError{StatusCode: 403, Body: `{"error":"forbidden"}`}
+	if got := apiForbidden.Kind(); got != KindForbidden {
+		t.Errorf("API 403 Kind() = %d, want KindForbidden", got)
+	}
+}
+
+// TestFormatErrorWAFBlock asserts the WAF block page yields the content-blocked
+// guidance (not the misleading permission message) and exits as a validation
+// error rather than an auth error.
+func TestFormatErrorWAFBlock(t *testing.T) {
+	withLang(t, "en_US.UTF-8")
+	httpErr := &HTTPError{Method: "POST", Path: "/api/issues/abc/comments", StatusCode: 403, Body: wafBlockBody}
+
+	got := FormatError(httpErr, false)
+	if !strings.Contains(got, "firewall") {
+		t.Errorf("expected WAF guidance, got %q", got)
+	}
+	if strings.Contains(got, "permission to access") {
+		t.Errorf("WAF block should not surface the permission message, got %q", got)
+	}
+	if code := ExitCodeFor(httpErr); code != ExitValidation {
+		t.Errorf("WAF block ExitCodeFor = %d, want ExitValidation(%d)", code, ExitValidation)
+	}
+}
+
 // TestFormatErrorAllKinds asserts that every ErrorKind produces a non-empty,
 // localized, user-facing message in both languages, and that none of them leak
 // the raw internal error string when debug is off.
@@ -82,7 +144,7 @@ func TestFormatErrorAllKinds(t *testing.T) {
 	allKinds := []ErrorKind{
 		KindNetworkTimeout, KindNetworkDNS, KindNetworkRefused, KindNetworkTLS, KindNetworkOffline,
 		KindAuthRequired, KindForbidden, KindNotFound, KindConflict, KindValidation,
-		KindRateLimited, KindServerError, KindUnknown,
+		KindRateLimited, KindServerError, KindContentBlocked, KindUnknown,
 	}
 	for _, lang := range []Language{LangEN, LangZH} {
 		for _, k := range allKinds {
