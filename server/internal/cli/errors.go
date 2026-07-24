@@ -40,6 +40,12 @@ const (
 	KindRateLimited  // 429
 	KindServerError  // 5xx
 
+	// KindContentBlocked is an edge Web Application Firewall / security proxy
+	// rejecting the request body before it reaches the API (typically a 403
+	// with an HTML block page). It is not an auth failure: the fix is to adjust
+	// the content, not to re-authenticate.
+	KindContentBlocked
+
 	// Anything we could not classify.
 	KindUnknown
 )
@@ -92,6 +98,8 @@ func (k ErrorKind) String() string {
 		return "rate_limited"
 	case KindServerError:
 		return "server_error"
+	case KindContentBlocked:
+		return "content_blocked"
 	case KindUnknown:
 		return "unknown"
 	default:
@@ -153,6 +161,12 @@ func WithUserMessage(msg string, err error) error {
 
 // Kind maps an HTTPError's status code onto an ErrorKind.
 func (e *HTTPError) Kind() ErrorKind {
+	// An edge WAF / security proxy that rejects the request body responds with
+	// its own HTML block page (commonly a 403), never the API's JSON. Detect
+	// that first so it is not mistaken for a genuine auth/permission 403.
+	if isWAFBlockPage(e.Body) {
+		return KindContentBlocked
+	}
 	switch e.StatusCode {
 	case 401:
 		return KindAuthRequired
@@ -172,6 +186,35 @@ func (e *HTTPError) Kind() ErrorKind {
 		}
 		return KindUnknown
 	}
+}
+
+// isWAFBlockPage reports whether an error body is an HTML block page served by
+// an edge Web Application Firewall / security proxy rather than the Multica
+// JSON API. WAFs (e.g. Tencent Cloud WAF) intercept requests whose body matches
+// a security signature — commonly code snippets that resemble an XSS payload —
+// and return an HTML block page with a generic status such as 403. Classifying
+// that as a permission error is misleading: the request never reached the API
+// and the fix is to adjust the content, not to re-authenticate.
+//
+// Detection requires both an HTML document (the API only ever returns JSON) and
+// a WAF/blocked marker, so an unrelated HTML gateway page (e.g. a 502) is not
+// misclassified as a content block.
+func isWAFBlockPage(body string) bool {
+	b := strings.ToLower(strings.TrimSpace(body))
+	if !strings.HasPrefix(b, "<!doctype html") && !strings.HasPrefix(b, "<html") {
+		return false
+	}
+	for _, marker := range []string{
+		"waf",      // Tencent "WAF拦截页面" / block-page assets on waf.qq.com
+		"firewall", // generic English WAF block pages
+		"web应用防护",  // Tencent Cloud WAF block copy
+		"访问拦截",     // Tencent Cloud WAF block copy
+	} {
+		if strings.Contains(b, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // classifyNetworkError inspects a transport-layer error and returns the
@@ -331,6 +374,10 @@ var kindMessages = map[ErrorKind][2]string{
 		"The Multica service is temporarily unavailable (server error). Please try again later; if it persists, contact support. Re-run with --debug to see the raw server response.",
 		"Multica 服务暂时不可用（服务器错误）。请稍后重试；若持续出现请联系支持。可加 --debug 查看服务器原始响应。",
 	},
+	KindContentBlocked: {
+		"Your request was blocked by a web application firewall: the content matched a security rule (often a code snippet that resembles a script or injection pattern). This is not a permission problem. Edit the content to avoid the flagged pattern — for example, put a space before a '(' that follows a function name, or use bracket syntax — and try again. Re-run with --debug to see the raw block page.",
+		"请求被 Web 应用防火墙（WAF）拦截：内容命中了安全规则（通常是形似脚本或注入的代码片段）。这不是权限问题。请调整内容以避开被拦的写法——例如在函数名与其后的左括号之间加一个空格，或改用中括号语法——然后重试。可加 --debug 查看原始拦截页面。",
+	},
 	KindUnknown: {
 		"An unexpected error occurred.",
 		"发生未知错误。",
@@ -481,7 +528,7 @@ func ExitCodeFor(err error) int {
 			return ExitAuth
 		case KindNotFound:
 			return ExitNotFound
-		case KindValidation:
+		case KindValidation, KindContentBlocked:
 			return ExitValidation
 		default:
 			return ExitGeneric
